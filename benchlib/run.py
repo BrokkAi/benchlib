@@ -40,11 +40,13 @@ class RunResult:
 class TaskKey:
     """
     Public API key for mapping run results.
-    Identifies a single (revision, model, run_number).
+    Identifies a single (revision, model, run_number, task_id).
+    task_id allows multiple tasks per revision (e.g., SWE-bench instances).
     """
     revision: str
     model: str
     run_number: int
+    task_id: str
 
 
 _DEFAULT_CLI_BIN_PATH = pathlib.Path("../brokk/cli")
@@ -90,12 +92,13 @@ def run_one_revision(
     jvm_args: list[str],
     stagger_seconds: int,
     model: str,
-    get_cli_args: Callable[[str], list[str]],
+    task_id: str,
+    get_cli_args: Callable[[str, str], list[str]],
     execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess],
     commit_tests: Callable[[pathlib.Path, pathlib.Path, str], None] | None = None,
 ) -> RunResult:
     """
-    Execute the workflow for a single (revision, model, run_number).
+    Execute the workflow for a single (revision, model, run_number, task_id).
 
     - If commit_tests is None:
         * git reset --hard <revision>
@@ -103,7 +106,7 @@ def run_one_revision(
         * git reset --hard <revision>^
         * commit_tests(project_path, worktree_path, revision) should produce a HEAD commit (tests snapshot)
         * write "01-tests.diff" = `git show HEAD`
-    - Run agent with CLI args from get_cli_args(revision).
+    - Run agent with CLI args from get_cli_args(revision, task_id).
     - If agent succeeds: commit "Agent work", patch=`git show HEAD`
       If agent fails (no commit): patch=`git diff` (may be empty).
     - Archive with 02-agent.diff and optional 01-tests.diff; return created zip path.
@@ -205,7 +208,7 @@ def run_one_revision(
         # ------------------------------------------------------------------
         # 2. Run Brokk CLI agent task using bpr-provided args
         # ------------------------------------------------------------------
-        agent_args = list(get_cli_args(revision) or [])
+        agent_args = list(get_cli_args(revision, task_id) or [])
         second_cmd: list[str] = [
             str(CLI_BIN),
             *jvm_args,
@@ -307,7 +310,8 @@ def run_with_retries(
     jvm_args: list[str],
     stagger_seconds: int,
     model: str,
-    get_cli_args: Callable[[str], list[str]],
+    task_id: str,
+    get_cli_args: Callable[[str, str], list[str]],
     execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess],
     commit_tests: Callable[[pathlib.Path, pathlib.Path, str], None] | None = None,
 ) -> tuple[RunResult, bool]:
@@ -333,6 +337,7 @@ def run_with_retries(
             jvm_args=jvm_args,
             stagger_seconds=stagger_seconds,
             model=model,
+            task_id=task_id,
             get_cli_args=get_cli_args,
             execute_tests=execute_tests,
             commit_tests=commit_tests,
@@ -383,16 +388,16 @@ def run_many_tasks(
     project: str,
     results_root: pathlib.Path,
     threads: int,
-    jobs: list[tuple[str, str, int]],  # (revision, model, run_number)
+    jobs: list[tuple[str, str, int, str]],  # (revision, model, run_number, task_id)
     jvm_args: list[str],
     stagger_seconds: int,
-    get_cli_args: Callable[[str], list[str]],
+    get_cli_args: Callable[[str, str], list[str]],
     execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess],
     commit_tests: Callable[[pathlib.Path, pathlib.Path, str], None] | None = None,
 ) -> dict[TaskKey, RunResult]:
     """
     Run multiple jobs concurrently. Each job supplies callables for:
-      - get_cli_args(revision)
+      - get_cli_args(revision, task_id)
       - execute_tests(project_path, worktree_path)
       - commit_tests(project_path, worktree_path, revision) [optional]
     Returns a mapping TaskKey -> RunResult.
@@ -414,16 +419,17 @@ def run_many_tasks(
                 jvm_args,
                 stagger_seconds,
                 model,
+                task_id,
                 get_cli_args,
                 execute_tests,
                 commit_tests,
-            ): (rev, model, run_number)
-            for (rev, model, run_number) in jobs
+            ): (rev, model, run_number, task_id)
+            for (rev, model, run_number, task_id) in jobs
         }
         try:
             for future in concurrent.futures.as_completed(future_to_job):
-                rev, model, run_number = future_to_job[future]
-                key = TaskKey(revision=rev, model=model, run_number=run_number)
+                rev, model, run_number, task_id = future_to_job[future]
+                key = TaskKey(revision=rev, model=model, run_number=run_number, task_id=task_id)
                 try:
                     res, hit_retry_max = future.result()
                     results_map[key] = res
@@ -433,7 +439,7 @@ def run_many_tasks(
                         retry_gave_up_by_model[model].add(rev)
                 except Exception as exc:
                     print(
-                        f"Fatal error while processing revision '{rev}' with model '{model}' (run {run_number}): {exc}",
+                        f"Fatal error while processing revision '{rev}' with model '{model}' (run {run_number}, task '{task_id}'): {exc}",
                         file=sys.stderr,
                     )
                     raise

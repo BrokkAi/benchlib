@@ -8,3 +8,8 @@
 !.brokk/style.md
 !.brokk/review.md
 !.brokk/project.properties
+
+__pycache__/
+benchlib.egg-info/
+uv.lock
+.venv/
