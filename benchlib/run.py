@@ -90,8 +90,8 @@ def run_one_revision(
     jvm_args: list[str],
     stagger_seconds: int,
     model: str,
-    get_cli_args: Callable[[str], list[str]],
-    execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess],
+    get_cli_args: Callable[[TaskKey], list[str]],
+    execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess] | None,
     commit_tests: Callable[[pathlib.Path, pathlib.Path, str], None] | None = None,
 ) -> RunResult:
     """
@@ -205,7 +205,8 @@ def run_one_revision(
         # ------------------------------------------------------------------
         # 2. Run Brokk CLI agent task using bpr-provided args
         # ------------------------------------------------------------------
-        agent_args = list(get_cli_args(revision) or [])
+        task_key = TaskKey(revision=revision, model=model, run_number=run_number)
+        agent_args = list(get_cli_args(task_key) or [])
         second_cmd: list[str] = [
             str(CLI_BIN),
             *jvm_args,
@@ -250,28 +251,32 @@ def run_one_revision(
         results_dir.mkdir(parents=True, exist_ok=True)
         results_path = results_dir / f"{model}-{revision}.json"
 
-        # Execute tests only if agent succeeded (we have a committed state)
+        # Execute tests only if agent succeeded and a test runner is provided
         outcome = RunOutcome.AGENT_FAILED
         if agent_proc.returncode == 0:
-            try:
-                test_cp = execute_tests(project_path, worktree_path)
-                tests_failed = (test_cp.returncode != 0)
-                if metrics is None:
-                    metrics = {}
-                if tests_failed:
-                    metrics["stopReason"] = "HARNESS_TESTS_FAILED"
+            if execute_tests is None:
+                # Tests are explicitly skipped
+                outcome = RunOutcome.SUCCESS
+            else:
+                try:
+                    test_cp = execute_tests(project_path, worktree_path)
+                    tests_failed = (test_cp.returncode != 0)
+                    if metrics is None:
+                        metrics = {}
+                    if tests_failed:
+                        metrics["stopReason"] = "HARNESS_TESTS_FAILED"
+                        outcome = RunOutcome.TESTS_FAILED
+                    else:
+                        outcome = RunOutcome.SUCCESS
+                except Exception as exc:
                     outcome = RunOutcome.TESTS_FAILED
-                else:
-                    outcome = RunOutcome.SUCCESS
-            except Exception as exc:
-                outcome = RunOutcome.TESTS_FAILED
-                if metrics is None:
-                    metrics = {}
-                metrics["stopReason"] = f"HARNESS_EXECUTION_ERROR: {exc}"
-            finally:
-                # Ensure tests log existence for aggregation
-                if not tests_log_path.exists():
-                    print("execute_tests did not create tests.txt; logging an error.", file=sys.stderr)
+                    if metrics is None:
+                        metrics = {}
+                    metrics["stopReason"] = f"HARNESS_EXECUTION_ERROR: {exc}"
+                finally:
+                    # Ensure tests log existence for aggregation
+                    if not tests_log_path.exists():
+                        print("execute_tests did not create tests.txt; logging an error.", file=sys.stderr)
 
         # Persist metrics JSON (even if minimal) to support retry heuristics
         to_write_metrics = metrics if metrics is not None else {"stopReason": "AGENT_FAILED"}
@@ -307,8 +312,8 @@ def run_with_retries(
     jvm_args: list[str],
     stagger_seconds: int,
     model: str,
-    get_cli_args: Callable[[str], list[str]],
-    execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess],
+    get_cli_args: Callable[[TaskKey], list[str]],
+    execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess] | None,
     commit_tests: Callable[[pathlib.Path, pathlib.Path, str], None] | None = None,
 ) -> tuple[RunResult, bool]:
     """
@@ -386,14 +391,14 @@ def run_many_tasks(
     jobs: list[tuple[str, str, int]],  # (revision, model, run_number)
     jvm_args: list[str],
     stagger_seconds: int,
-    get_cli_args: Callable[[str], list[str]],
-    execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess],
+    get_cli_args: Callable[[TaskKey], list[str]],
+    execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess] | None,
     commit_tests: Callable[[pathlib.Path, pathlib.Path, str], None] | None = None,
 ) -> dict[TaskKey, RunResult]:
     """
     Run multiple jobs concurrently. Each job supplies callables for:
       - get_cli_args(revision)
-      - execute_tests(project_path, worktree_path)
+      - execute_tests(project_path, worktree_path) [optional: pass None to skip tests]
       - commit_tests(project_path, worktree_path, revision) [optional]
     Returns a mapping TaskKey -> RunResult.
     """
