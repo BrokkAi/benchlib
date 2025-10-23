@@ -37,14 +37,23 @@ class RunResult:
 
 
 @dataclass(frozen=True)
-class TaskKey:
+class Task:
     """
     Public API key for mapping run results.
-    Identifies a single (revision, model, run_number).
+    Identifies a single (revision, model, run_number, task_id).
+    task_id allows multiple tasks per revision (e.g., SWE-bench instances).
     """
     revision: str
     model: str
     run_number: int
+    task_id: str | None = None
+
+    def filename(self) -> str:
+        """Generate results filename based on whether task_id is present."""
+        if self.task_id:
+            return f"{self.model}-{self.revision}-{self.task_id}.json"
+        else:
+            return f"{self.model}-{self.revision}.json"
 
 
 _DEFAULT_CLI_BIN_PATH = pathlib.Path("../brokk/cli")
@@ -82,20 +91,18 @@ def _run_cli(cmd: list[str], log_file: pathlib.Path) -> subprocess.CompletedProc
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout=None, stderr=None)
 
 
-def run_one_revision(
+def _run_one_task(
     project: str,
-    revision: str,
+    task: Task,
     results_root: pathlib.Path,
-    run_number: int,
     jvm_args: list[str],
     stagger_seconds: int,
-    model: str,
-    get_cli_args: Callable[[TaskKey], list[str]],
+    get_cli_args: Callable[[Task], list[str]],
     execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess] | None,
     commit_tests: Callable[[pathlib.Path, pathlib.Path, str], None] | None = None,
 ) -> RunResult:
     """
-    Execute the workflow for a single (revision, model, run_number).
+    Execute the workflow for a single (revision, model, run_number, task_id).
 
     - If commit_tests is None:
         * git reset --hard <revision>
@@ -136,10 +143,10 @@ def run_one_revision(
             raise
 
     # Resolve short hash for naming
-    revshort = _git_generic(project_path, "rev-parse", "--short", revision)
+    revshort = _git_generic(project_path, "rev-parse", "--short", task.revision)
 
     session = datetime.datetime.now().strftime("%y-%m-%d-%H-%M")
-    workdir_name = f"{model}-{revshort}-{run_number}-{session}"
+    workdir_name = f"{task.model}-{revshort}-{task.run_number}-{session}"
     worktree_path = pathlib.Path.home() / "brokkbench" / project_path.name / workdir_name
 
     # Helper to compute run-output amalgam
@@ -183,12 +190,12 @@ def run_one_revision(
 
         # Reset based on commit_tests presence
         if commit_tests is None:
-            _git_generic(worktree_path, "reset", "--hard", revision)
+            _git_generic(worktree_path, "reset", "--hard", task.revision)
             pre_agent_head = _git_generic(worktree_path, "rev-parse", "HEAD")
         else:
-            _git_generic(worktree_path, "reset", "--hard", f"{revision}^")
+            _git_generic(worktree_path, "reset", "--hard", f"{task.revision}^")
             head_before = _git_generic(worktree_path, "rev-parse", "HEAD")
-            commit_tests(project_path, worktree_path, revision)
+            commit_tests(project_path, worktree_path, task.revision)
             head_after = _git_generic(worktree_path, "rev-parse", "HEAD")
             if head_before == head_after:
                 raise ValueError("commit_tests did not create a new HEAD commit as required.")
@@ -205,8 +212,7 @@ def run_one_revision(
         # ------------------------------------------------------------------
         # 2. Run Brokk CLI agent task using bpr-provided args
         # ------------------------------------------------------------------
-        task_key = TaskKey(revision=revision, model=model, run_number=run_number)
-        agent_args = list(get_cli_args(task_key) or [])
+        agent_args = list(get_cli_args(task) or [])
         second_cmd: list[str] = [
             str(CLI_BIN),
             *jvm_args,
@@ -247,9 +253,9 @@ def run_one_revision(
         # ------------------------------------------------------------------
         # 4. Write results JSON
         # ------------------------------------------------------------------
-        results_dir = pathlib.Path(results_root) / f"{project_path.name}{run_number}"
+        results_dir = pathlib.Path(results_root) / f"{project_path.name}{task.run_number}"
         results_dir.mkdir(parents=True, exist_ok=True)
-        results_path = results_dir / f"{model}-{revision}.json"
+        results_path = results_dir / task.filename()
 
         # Execute tests only if agent succeeded and a test runner is provided
         outcome = RunOutcome.AGENT_FAILED
@@ -306,13 +312,11 @@ def run_one_revision(
 
 def run_with_retries(
     project: str,
-    revision: str,
+    task: Task,
     results_root: pathlib.Path,
-    run_number: int,
     jvm_args: list[str],
     stagger_seconds: int,
-    model: str,
-    get_cli_args: Callable[[TaskKey], list[str]],
+    get_cli_args: Callable[[Task], list[str]],
     execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess] | None,
     commit_tests: Callable[[pathlib.Path, pathlib.Path, str], None] | None = None,
 ) -> tuple[RunResult, bool]:
@@ -330,14 +334,12 @@ def run_with_retries(
     hit_retry_max = False
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        result = run_one_revision(
+        result = _run_one_task(
             project=project,
-            revision=revision,
+            task=task,
             results_root=results_root,
-            run_number=run_number,
             jvm_args=jvm_args,
             stagger_seconds=stagger_seconds,
-            model=model,
             get_cli_args=get_cli_args,
             execute_tests=execute_tests,
             commit_tests=commit_tests,
@@ -345,8 +347,8 @@ def run_with_retries(
         last_result = result
 
         # Locate the metrics file written by `run_one_revision`.
-        results_dir = pathlib.Path(results_root) / f"{project_path.name}{run_number}"
-        results_path = results_dir / f"{model}-{revision}.json"
+        results_dir = pathlib.Path(results_root) / f"{project_path.name}{task.run_number}"
+        results_path = results_dir / task.filename()
 
         metrics = None
         if results_path.exists():
@@ -384,27 +386,49 @@ def run_with_retries(
     return last_result, hit_retry_max
 
 
-def run_many_tasks(
+def run_many_jobs(
     project: str,
     results_root: pathlib.Path,
     threads: int,
     jobs: list[tuple[str, str, int]],  # (revision, model, run_number)
     jvm_args: list[str],
     stagger_seconds: int,
-    get_cli_args: Callable[[TaskKey], list[str]],
+    get_cli_args: Callable[[Task], list[str]],
     execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess] | None,
     commit_tests: Callable[[pathlib.Path, pathlib.Path, str], None] | None = None,
-) -> dict[TaskKey, RunResult]:
+) -> dict[Task, RunResult]:
+    return run_many_tasks(
+        project=project,
+        results_root=results_root,
+        threads=threads,
+        tasks=[Task(revision=rev, model=model, run_number=run_number) for (rev, model, run_number) in jobs],
+        jvm_args=jvm_args,
+        stagger_seconds=stagger_seconds,
+        get_cli_args=get_cli_args,
+        execute_tests=execute_tests,
+        commit_tests=commit_tests)
+
+def run_many_tasks(
+    project: str,
+    results_root: pathlib.Path,
+    threads: int,
+    tasks: list[Task],  # (revision, model, run_number, task_id)
+    jvm_args: list[str],
+    stagger_seconds: int,
+    get_cli_args: Callable[[Task], list[str]],
+    execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess] | None,
+    commit_tests: Callable[[pathlib.Path, pathlib.Path, str], None] | None = None,
+) -> dict[Task, RunResult]:
     """
     Run multiple jobs concurrently. Each job supplies callables for:
-      - get_cli_args(revision)
+      - get_cli_args(task)
       - execute_tests(project_path, worktree_path) [optional: pass None to skip tests]
       - commit_tests(project_path, worktree_path, revision) [optional]
-    Returns a mapping TaskKey -> RunResult.
+    Returns a mapping Task -> RunResult.
     """
     os.environ["BRK_CODEAGENT_METRICS"] = "true"
 
-    results_map: dict[TaskKey, RunResult] = {}
+    results_map: dict[Task, RunResult] = {}
     successful_tasks_by_model: dict[str, set[str]] = defaultdict(set)
     retry_gave_up_by_model: dict[str, set[str]] = defaultdict(set)
 
@@ -413,32 +437,29 @@ def run_many_tasks(
             executor.submit(
                 run_with_retries,
                 project,
-                rev,
+                task,
                 results_root,
-                run_number,
                 jvm_args,
                 stagger_seconds,
-                model,
                 get_cli_args,
                 execute_tests,
                 commit_tests,
-            ): (rev, model, run_number)
-            for (rev, model, run_number) in jobs
+            ): task
+            for task in tasks
         }
         try:
             for future in concurrent.futures.as_completed(future_to_job):
-                rev, model, run_number = future_to_job[future]
-                key = TaskKey(revision=rev, model=model, run_number=run_number)
+                task = future_to_job[future]
                 try:
                     res, hit_retry_max = future.result()
-                    results_map[key] = res
+                    results_map[task] = res
                     if res.outcome == RunOutcome.SUCCESS:
-                        successful_tasks_by_model[model].add(rev)
+                        successful_tasks_by_model[task.model].add(task.revision)
                     elif hit_retry_max:
-                        retry_gave_up_by_model[model].add(rev)
+                        retry_gave_up_by_model[task.model].add(task.revision)
                 except Exception as exc:
                     print(
-                        f"Fatal error while processing revision '{rev}' with model '{model}' (run {run_number}): {exc}",
+                        f"Fatal error while processing revision '{task.revision}' with model '{task.model}' (run {task.run_number}, task '{task.task_id}'): {exc}",
                         file=sys.stderr,
                     )
                     raise
