@@ -287,7 +287,7 @@ def _run_one_task(
         # Persist metrics JSON (even if minimal) to support retry heuristics
         to_write_metrics = metrics if metrics is not None else {"stopReason": "AGENT_FAILED"}
         with open(results_path, "w", encoding="utf-8") as res_fp:
-            json.dump(to_write_metrics, res_fp)
+            json.dump(to_write_metrics, res_fp, indent=2)
             res_fp.write("\n")
 
         # Aggregate logs
