@@ -310,7 +310,7 @@ def _run_one_task(
         raise
 
 
-def run_with_retries(
+def _run_with_retries(
     project: str,
     task: Task,
     results_root: pathlib.Path,
@@ -435,7 +435,7 @@ def run_many_tasks(
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
         future_to_job = {
             executor.submit(
-                run_with_retries,
+                _run_with_retries,
                 project,
                 task,
                 results_root,
