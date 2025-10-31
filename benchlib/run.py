@@ -146,7 +146,10 @@ def _run_one_task(
     revshort = _git_generic(project_path, "rev-parse", "--short", task.revision)
 
     session = datetime.datetime.now().strftime("%y-%m-%d-%H-%M")
-    workdir_name = f"{task.model}-{revshort}-{task.run_number}-{session}"
+    if task.task_id:
+        workdir_name = f"{task.model}-{revshort}-{task.task_id}-{task.run_number}-{session}"
+    else:
+        workdir_name = f"{task.model}-{revshort}-{task.run_number}-{session}"
     worktree_path = pathlib.Path.home() / "brokkbench" / project_path.name / workdir_name
 
     # Helper to compute run-output amalgam
