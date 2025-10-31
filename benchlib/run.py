@@ -227,7 +227,7 @@ def _run_one_task(
         if agent_log_path.exists():
             with open(agent_log_path, "r", encoding="utf-8") as log_fp:
                 for line in log_fp:
-                    if line.startswith("BRK_CODEAGENT_METRICS="):
+                    if line.startswith("BRK_CODEAGENT_METRICS=") or line.startswith("BRK_SEARCHAGENT_METRICS="):
                         metrics_json = line.strip().split("=", 1)[1]
                         break
         metrics: dict | None = json.loads(metrics_json) if metrics_json else None
@@ -426,7 +426,7 @@ def run_many_tasks(
       - commit_tests(project_path, worktree_path, revision) [optional]
     Returns a mapping Task -> RunResult.
     """
-    os.environ["BRK_CODEAGENT_METRICS"] = "true"
+    os.environ["BRK_COLLECT_METRICS"] = "true"
 
     results_map: dict[Task, RunResult] = {}
     successful_tasks_by_model: dict[str, set[str]] = defaultdict(set)
