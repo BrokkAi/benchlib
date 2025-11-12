@@ -260,9 +260,9 @@ def _run_one_task(
         results_dir.mkdir(parents=True, exist_ok=True)
         results_path = results_dir / task.filename()
 
-        # Execute tests only if agent succeeded and a test runner is provided
+        # Execute tests only if agent succeeded and stopReason is SUCCESS and a test runner is provided
         outcome = RunOutcome.AGENT_FAILED
-        if agent_proc.returncode == 0:
+        if agent_proc.returncode == 0 and (metrics is not None and metrics.get("stopReason") == "SUCCESS"):
             if execute_tests is None:
                 # Tests are explicitly skipped
                 outcome = RunOutcome.SUCCESS
