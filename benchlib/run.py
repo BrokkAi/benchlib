@@ -177,6 +177,9 @@ def _run_one_task(
     try:
         os.makedirs(worktree_path.parent, exist_ok=True)
 
+        if stagger_seconds and stagger_seconds > 0:
+            time.sleep(random.uniform(0, stagger_seconds))
+
         # Create work-tree via Brokk CLI (fixed)
         first_cmd = [
             str(CLI_BIN),
@@ -207,10 +210,6 @@ def _run_one_task(
             with open(worktree_path / "01-tests.diff", "w", encoding="utf-8") as fp:
                 fp.write(tests_diff)
             pre_agent_head = head_after
-
-        # Stagger AFTER validations/sanity checks
-        if stagger_seconds and stagger_seconds > 0:
-            time.sleep(random.uniform(0, stagger_seconds))
 
         # ------------------------------------------------------------------
         # 2. Run Brokk CLI agent task using bpr-provided args
