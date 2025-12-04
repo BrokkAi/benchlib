@@ -17,8 +17,9 @@ from collections import defaultdict
 
 class RunOutcome(enum.Enum):
     SUCCESS = 0
-    AGENT_FAILED = 1
-    TESTS_FAILED = 2
+    AGENT_ERROR = 1
+    AGENT_FAILED = 2
+    TESTS_FAILED = 3
 
 
 @dataclass(frozen=True)
@@ -119,9 +120,7 @@ def _run_one_task(
     if not (project_path / ".git").is_dir():
         raise ValueError(f"Project '{project}' is not a git repository.")
 
-    # ------------------------------------------------------------------
     # 1. set up the worktree
-    # ------------------------------------------------------------------
     def _git_generic(root: pathlib.Path, *git_args: str) -> str:
         """
         Helper to run git commands inside the work-tree and return stdout.
@@ -198,22 +197,23 @@ def _run_one_task(
         if commit_tests is None:
             _git_generic(worktree_path, "reset", "--hard", task.revision)
             pre_agent_head = _git_generic(worktree_path, "rev-parse", "HEAD")
+            print(f"Checked out revision {task.revision} ({pre_agent_head[:7]})", file=sys.stderr)
         else:
             _git_generic(worktree_path, "reset", "--hard", f"{task.revision}^")
             head_before = _git_generic(worktree_path, "rev-parse", "HEAD")
+            print(f"Checked out revision {task.revision}^ ({head_before[:7]})", file=sys.stderr)
             commit_tests(project_path, worktree_path, task.revision)
             head_after = _git_generic(worktree_path, "rev-parse", "HEAD")
             if head_before == head_after:
                 raise ValueError("commit_tests did not create a new HEAD commit as required.")
+            print(f"After commit_tests, HEAD is at {head_after[:7]}", file=sys.stderr)
             # Write 01-tests.diff
             tests_diff = _git_generic(worktree_path, "show", "HEAD")
             with open(worktree_path / "01-tests.diff", "w", encoding="utf-8") as fp:
                 fp.write(tests_diff)
             pre_agent_head = head_after
 
-        # ------------------------------------------------------------------
         # 2. Run Brokk CLI agent task using bpr-provided args
-        # ------------------------------------------------------------------
         agent_args = list(get_cli_args(task) or [])
         second_cmd: list[str] = [
             str(CLI_BIN),
@@ -232,13 +232,10 @@ def _run_one_task(
                     if line.startswith("BRK_CODEAGENT_METRICS=") or line.startswith("BRK_SEARCHAGENT_METRICS="):
                         metrics_json = line.strip().split("=", 1)[1]
                         break
-        metrics: dict | None = json.loads(metrics_json) if metrics_json else None
-        if metrics is not None:
-            metrics["worktree"] = str(worktree_path)
+        metrics: dict = json.loads(metrics_json) if metrics_json else {"stopReason": "UNKNOWN"}
+        metrics["worktree"] = str(worktree_path)
 
-        # ------------------------------------------------------------------
         # 3. Commit agent's work on success; compute patch either way
-        # ------------------------------------------------------------------
         patch_text = ""
         if agent_proc.returncode == 0:
             # Commit agent's work
@@ -252,16 +249,17 @@ def _run_one_task(
             except subprocess.CalledProcessError:
                 patch_text = ""
 
-        # ------------------------------------------------------------------
         # 4. Write results JSON
-        # ------------------------------------------------------------------
         results_dir = pathlib.Path(results_root) / f"{project_path.name}{task.run_number}"
         results_dir.mkdir(parents=True, exist_ok=True)
         results_path = results_dir / task.filename()
 
         # Execute tests only if agent succeeded and stopReason is SUCCESS and a test runner is provided
-        outcome = RunOutcome.AGENT_FAILED
-        if agent_proc.returncode == 0 and (metrics is not None and metrics.get("stopReason") == "SUCCESS"):
+        metrics["exit_code"] = agent_proc.returncode
+        if agent_proc.returncode != 0:
+            outcome = RunOutcome.AGENT_ERROR
+            metrics["stopReason"] = "AGENT_ERROR"
+        elif metrics.get("stopReason") == "SUCCESS":
             if execute_tests is None:
                 # Tests are explicitly skipped
                 outcome = RunOutcome.SUCCESS
@@ -269,8 +267,6 @@ def _run_one_task(
                 try:
                     test_cp = execute_tests(project_path, worktree_path)
                     tests_failed = (test_cp.returncode != 0)
-                    if metrics is None:
-                        metrics = {}
                     if tests_failed:
                         metrics["stopReason"] = "HARNESS_TESTS_FAILED"
                         outcome = RunOutcome.TESTS_FAILED
@@ -278,18 +274,18 @@ def _run_one_task(
                         outcome = RunOutcome.SUCCESS
                 except Exception as exc:
                     outcome = RunOutcome.TESTS_FAILED
-                    if metrics is None:
-                        metrics = {}
                     metrics["stopReason"] = f"HARNESS_EXECUTION_ERROR: {exc}"
                 finally:
                     # Ensure tests log existence for aggregation
                     if not tests_log_path.exists():
                         print("execute_tests did not create tests.txt; logging an error.", file=sys.stderr)
+        else:
+            # stopReason is set to something other than success, leave it alone
+            outcome = RunOutcome.AGENT_FAILED
 
         # Persist metrics JSON (even if minimal) to support retry heuristics
-        to_write_metrics = metrics if metrics is not None else {"stopReason": "AGENT_FAILED"}
         with open(results_path, "w", encoding="utf-8") as res_fp:
-            json.dump(to_write_metrics, res_fp, indent=2)
+            json.dump(metrics, res_fp, indent=2)
             res_fp.write("\n")
 
         # Aggregate logs
