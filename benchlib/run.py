@@ -225,13 +225,18 @@ def _run_one_task(
         agent_proc = _run_cli(second_cmd, agent_log_path)
 
         # Extract metrics from agent log (may be absent on failure)
-        metrics_json: str | None = None
+        # If both CODEAGENT and SEARCHAGENT metrics exist, prioritize CODEAGENT.
+        code_metrics_json: str | None = None
+        search_metrics_json: str | None = None
         if agent_log_path.exists():
             with open(agent_log_path, "r", encoding="utf-8") as log_fp:
                 for line in log_fp:
-                    if line.startswith("BRK_CODEAGENT_METRICS=") or line.startswith("BRK_SEARCHAGENT_METRICS="):
-                        metrics_json = line.strip().split("=", 1)[1]
-                        break
+                    if line.startswith("BRK_CODEAGENT_METRICS="):
+                        code_metrics_json = line.strip().split("=", 1)[1]
+                    elif line.startswith("BRK_SEARCHAGENT_METRICS="):
+                        search_metrics_json = line.strip().split("=", 1)[1]
+
+        metrics_json = code_metrics_json or search_metrics_json
         metrics: dict = json.loads(metrics_json) if metrics_json else {"stopReason": "UNKNOWN"}
         metrics["worktree"] = str(worktree_path)
 
