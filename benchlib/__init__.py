@@ -1,13 +1,6 @@
 """
-benchlib - A library for running automated code agent benchmarks.
+benchlib package marker.
 
-Usage:
-    from benchlib import run
-
-    # Use run.run_one_revision, run.run_with_retries, run.run_many_tasks
+This repository is exercised via pytest without necessarily being installed as a site-package,
+so we include an __init__.py to ensure 'import benchlib' works reliably.
 """
-
-from . import run
-
-__version__ = "0.1.0"
-__all__ = ["run"]

@@ -1,18 +1,20 @@
+import concurrent.futures
 import datetime
 import enum
 import json
 import os
 import pathlib
+import random
 import shutil
 import subprocess
 import sys
-import concurrent.futures
-from . import archive
-from typing import Callable
-import random
+import traceback
 import time
-from dataclasses import dataclass
 from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Callable
+
+from . import archive
 
 
 class RunOutcome(enum.Enum):
@@ -31,6 +33,7 @@ class RunResult:
     - archive: path to created zip, or None if skipped/unavailable
     - patch: text of 02-agent.diff; empty string if no agent commit and no changes
     """
+
     outcome: RunOutcome
     metrics: dict | None
     archive: pathlib.Path | None
@@ -41,91 +44,125 @@ class RunResult:
 class Task:
     """
     Public API key for mapping run results.
-    Identifies a single (revision, model, run_number, task_id).
-    task_id allows multiple tasks per revision (e.g., SWE-bench instances).
+
+    Identifies a single (project, revision, model, run_number, task_id).
+    Additional per-task execution configuration is carried as non-key fields.
     """
+
+    project: str
     revision: str
     model: str
     run_number: int
     task_id: str | None = None
+    job_env: dict[str, str] | None = field(default=None, compare=False, hash=False, repr=False)
+    heap_mb: int = field(default=0, compare=False, hash=False, repr=False)
+    properties: dict[str, str] | None = field(default=None, compare=False, hash=False, repr=False)
 
     def filename(self) -> str:
-        """Generate results filename based on whether task_id is present."""
         if self.task_id:
             return f"{self.model}-{self.revision}-{self.task_id}.json"
-        else:
-            return f"{self.model}-{self.revision}.json"
+        return f"{self.model}-{self.revision}.json"
 
 
-_DEFAULT_CLI_BIN_PATH = pathlib.Path("../brokk/cli")
-CLI_BIN = pathlib.Path(os.getenv("BRK_CLI_BIN", str(_DEFAULT_CLI_BIN_PATH)))
+def _resolve_cli_bin() -> pathlib.Path:
+    env_path = os.getenv("BRK_CLI_BIN")
+    if env_path:
+        return pathlib.Path(env_path)
+
+    try:
+        from . import cli as _cli  # type: ignore
+    except Exception:
+        _cli = None
+
+    if _cli is not None:
+        try:
+            candidate = getattr(_cli, "CLI_BIN", None)
+            if candidate:
+                return pathlib.Path(candidate)
+        except Exception:
+            pass
+
+        try:
+            getter = getattr(_cli, "get_cli_bin", None)
+            if callable(getter):
+                candidate = getter()
+                if candidate:
+                    return pathlib.Path(candidate)
+        except Exception:
+            pass
+
+    return pathlib.Path("../brokk/cli")
 
 
-def _run_cli(cmd: list[str], log_file: pathlib.Path) -> subprocess.CompletedProcess:
-    """
-    Helper to execute Brokk CLI commands and append output
-    to the supplied log-file. If the BB_DEBUG environment variable
-    is set, the output is also echoed to the console.
-    """
+def _merged_env(task_env: dict[str, str] | None) -> dict[str, str]:
+    env = dict(os.environ)
+    env["BRK_COLLECT_METRICS"] = "true"
+    if task_env:
+        env.update(task_env)
+    return env
+
+
+def _run_cli(cmd: list[str], log_file: pathlib.Path, env: dict[str, str] | None) -> subprocess.CompletedProcess:
     full_cmd = cmd
 
     if os.getenv("BB_DEBUG"):
         print(f"Running command: {' '.join(full_cmd)}", file=sys.stderr)
 
-    with subprocess.Popen(
-        full_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    ) as proc, open(log_file, "ab") as log_fp:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            log_fp.write(line)
-            if os.getenv("BB_DEBUG"):
-                try:
-                    sys.stderr.buffer.write(line)
-                    sys.stderr.flush()
-                except AttributeError:
-                    sys.stderr.write(line.decode(errors="replace"))
-                    sys.stderr.flush()
-        proc.wait()
+    try:
+        with subprocess.Popen(
+            full_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+        ) as proc, open(log_file, "ab") as log_fp:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                log_fp.write(line)
+                if os.getenv("BB_DEBUG"):
+                    try:
+                        sys.stderr.buffer.write(line)
+                        sys.stderr.flush()
+                    except AttributeError:
+                        sys.stderr.write(line.decode(errors="replace"))
+                        sys.stderr.flush()
+            proc.wait()
+    except Exception as exc:
+        raise RuntimeError(f"Failed to execute command: {' '.join(full_cmd)}") from exc
 
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout=None, stderr=None)
 
 
+def _append_task_log(log_path: pathlib.Path, message: str) -> None:
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_path, "a", encoding="utf-8") as fp:
+            fp.write(f"[{ts}] {message}\n")
+    except Exception:
+        # Never fail task execution because of logging problems.
+        pass
+
+
 def _run_one_task(
-    project: str,
     task: Task,
     results_root: pathlib.Path,
     jvm_args: list[str],
     stagger_seconds: int,
     get_cli_args: Callable[[Task], list[str]],
-    execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess] | None,
-    commit_tests: Callable[[pathlib.Path, pathlib.Path, str], None] | None = None,
+    execute_tests: Callable[[pathlib.Path, pathlib.Path, dict[str, str], dict[str, str] | None], subprocess.CompletedProcess]
+    | None,
+    commit_tests: Callable[[pathlib.Path, pathlib.Path, str, dict[str, str], dict[str, str] | None], None]
+    | None = None,
+    on_task_start: Callable[[Task, pathlib.Path, int], None] | None = None,
+    attempt: int = 1,
 ) -> RunResult:
-    """
-    Execute the workflow for a single (revision, model, run_number, task_id).
-
-    - If commit_tests is None:
-        * git reset --hard <revision>
-      else:
-        * git reset --hard <revision>^
-        * commit_tests(project_path, worktree_path, revision) should produce a HEAD commit (tests snapshot)
-        * write "01-tests.diff" = `git show HEAD`
-    - Run agent with CLI args from get_cli_args(revision).
-    - If agent succeeds: commit "Agent work", patch=`git show HEAD`
-      If agent fails (no commit): patch=`git diff` (may be empty).
-    - Archive with 02-agent.diff and optional 01-tests.diff; return created zip path.
-    """
-    project_path = pathlib.Path(project).resolve()
+    project_path = pathlib.Path(task.project).resolve()
     if not (project_path / ".git").is_dir():
-        raise ValueError(f"Project '{project}' is not a git repository.")
+        raise ValueError(f"Project '{task.project}' is not a git repository.")
 
-    # 1. set up the worktree
+    env = _merged_env(task.job_env)
+
     def _git_generic(root: pathlib.Path, *git_args: str) -> str:
-        """
-        Helper to run git commands inside the work-tree and return stdout.
-        Raises CalledProcessError if the command fails.
-        """
         try:
             return subprocess.run(
                 ["git", *git_args],
@@ -133,6 +170,7 @@ def _run_one_task(
                 text=True,
                 capture_output=True,
                 check=True,
+                env=env,
             ).stdout.strip()
         except subprocess.CalledProcessError as e:
             print(
@@ -141,22 +179,16 @@ def _run_one_task(
             )
             raise
 
-    # Resolve short hash for naming
     revshort = _git_generic(project_path, "rev-parse", "--short", task.revision)
 
-    session = datetime.datetime.now().strftime("%y-%m-%d-%H-%M")
+    session = datetime.datetime.now().strftime("%y-%m-%d-%H-%M-%S")
     if task.task_id:
         workdir_name = f"{task.model}-{revshort}-{task.task_id}-{task.run_number}-{session}"
     else:
         workdir_name = f"{task.model}-{revshort}-{task.run_number}-{session}"
     worktree_path = pathlib.Path.home() / "brokkbench" / project_path.name / workdir_name
 
-    # Helper to compute run-output amalgam
     def _write_run_output(paths: list[pathlib.Path]) -> None:
-        """
-        Combine the supplied log files into `run-output.txt`
-        inside the worktree directory. Missing paths are ignored.
-        """
         run_output_path = worktree_path / "run-output.txt"
         worktree_path.mkdir(parents=True, exist_ok=True)
         with open(run_output_path, "wb") as out_fp:
@@ -169,32 +201,56 @@ def _run_one_task(
                     shutil.copyfileobj(src_fp, out_fp)
                 out_fp.write(b"\n")
 
+    cli_bin = _resolve_cli_bin()
+
     pre_agent_head: str | None = None
+    bootstrap_log_path = worktree_path.parent / f"{workdir_name}-bootstrap.txt"
     agent_log_path = worktree_path.parent / f"{workdir_name}-agent.txt"
     tests_log_path = worktree_path / "tests.txt"
 
+    def _log_stage(message: str) -> None:
+        _append_task_log(bootstrap_log_path, message)
+        if os.getenv("BB_DEBUG"):
+            print(f"[{task.model}] {message}", file=sys.stderr)
+
     try:
+        _log_stage(
+            f"Starting task: project={project_path} revision={task.revision} run_number={task.run_number} "
+            f"task_id={task.task_id} cli={cli_bin}"
+        )
+        if on_task_start is not None:
+            try:
+                on_task_start(task, worktree_path, attempt)
+            except TypeError:
+                on_task_start(task, worktree_path)
         os.makedirs(worktree_path.parent, exist_ok=True)
+        _log_stage(f"Created worktree parent: {worktree_path.parent}")
 
         if stagger_seconds and stagger_seconds > 0:
+            _log_stage(f"Applying stagger: up to {stagger_seconds} seconds")
             time.sleep(random.uniform(0, stagger_seconds))
 
-        # Create work-tree via Brokk CLI (fixed)
+        _log_stage(f"First cli command: {str(cli_bin)} --project={project_path} --worktree={worktree_path}")
+
         first_cmd = [
-            str(CLI_BIN),
+            str(cli_bin),
             *jvm_args,
             f"--project={project_path}",
             f"--worktree={worktree_path}",
         ]
-        first_ret = _run_cli(first_cmd, agent_log_path)
+        first_ret = _run_cli(first_cmd, agent_log_path, env=env)
+        _log_stage(f"First cli return code: {first_ret.returncode}")
         if first_ret.returncode != 0:
+            _log_stage(f"First cli failed with return code {first_ret.returncode}")
             _write_run_output([agent_log_path])
-            # Archive and return failure
-            zip_path = archive.archive_worktree(project_path, worktree_path, pre_agent_head=None)
+            try:
+                zip_path = archive.archive_worktree(project_path, worktree_path, pre_agent_head=None)
+            except Exception:
+                zip_path = None
             return RunResult(RunOutcome.AGENT_FAILED, metrics=None, archive=zip_path, patch="")
 
-        # Reset based on commit_tests presence
         if commit_tests is None:
+            _log_stage(f"Checking out revision {task.revision}")
             _git_generic(worktree_path, "reset", "--hard", task.revision)
             pre_agent_head = _git_generic(worktree_path, "rev-parse", "HEAD")
             print(f"Checked out revision {task.revision} ({pre_agent_head[:7]})", file=sys.stderr)
@@ -202,30 +258,34 @@ def _run_one_task(
             _git_generic(worktree_path, "reset", "--hard", f"{task.revision}^")
             head_before = _git_generic(worktree_path, "rev-parse", "HEAD")
             print(f"Checked out revision {task.revision}^ ({head_before[:7]})", file=sys.stderr)
-            commit_tests(project_path, worktree_path, task.revision)
+            if commit_tests is None:
+                raise RuntimeError("commit_tests callback is required for this execution mode")
+            try:
+                commit_tests(project_path, worktree_path, task.revision, env, task.properties)
+            except TypeError:
+                commit_tests(project_path, worktree_path, task.revision, env)
             head_after = _git_generic(worktree_path, "rev-parse", "HEAD")
             if head_before == head_after:
                 raise ValueError("commit_tests did not create a new HEAD commit as required.")
             print(f"After commit_tests, HEAD is at {head_after[:7]}", file=sys.stderr)
-            # Write 01-tests.diff
             tests_diff = _git_generic(worktree_path, "show", "HEAD")
             with open(worktree_path / "01-tests.diff", "w", encoding="utf-8") as fp:
                 fp.write(tests_diff)
             pre_agent_head = head_after
 
-        # 2. Run Brokk CLI agent task using bpr-provided args
         agent_args = list(get_cli_args(task) or [])
+        _log_stage(f"Agent args: {agent_args}")
         second_cmd: list[str] = [
-            str(CLI_BIN),
+            str(cli_bin),
             *jvm_args,
             f"--project={project_path}",
             f"--worktree={worktree_path}",
             *agent_args,
         ]
-        agent_proc = _run_cli(second_cmd, agent_log_path)
+        _log_stage(f"Second cli command: {' '.join(second_cmd)}")
+        agent_proc = _run_cli(second_cmd, agent_log_path, env=env)
+        _log_stage(f"Second cli return code: {agent_proc.returncode}")
 
-        # Extract metrics from agent log (may be absent on failure)
-        # If both CODEAGENT and SEARCHAGENT metrics exist, prioritize CODEAGENT.
         code_metrics_json: str | None = None
         search_metrics_json: str | None = None
         if agent_log_path.exists():
@@ -239,40 +299,36 @@ def _run_one_task(
         metrics_json = code_metrics_json or search_metrics_json
         metrics: dict = json.loads(metrics_json) if metrics_json else {"stopReason": "UNKNOWN"}
         metrics["worktree"] = str(worktree_path)
+        metrics["exit_code"] = agent_proc.returncode
 
-        # 3. Commit agent's work on success; compute patch either way
         patch_text = ""
         if agent_proc.returncode == 0:
-            # Commit agent's work
             _git_generic(worktree_path, "add", "-A")
             _git_generic(worktree_path, "commit", "--allow-empty", "-m", "Agent work")
             patch_text = _git_generic(worktree_path, "show", "HEAD")
         else:
-            # No commit, compute dirty diff (may be empty)
             try:
                 patch_text = _git_generic(worktree_path, "diff")
             except subprocess.CalledProcessError:
                 patch_text = ""
 
-        # 4. Write results JSON
         results_dir = pathlib.Path(results_root) / f"{project_path.name}{task.run_number}"
         results_dir.mkdir(parents=True, exist_ok=True)
         results_path = results_dir / task.filename()
 
-        # Execute tests only if agent succeeded and stopReason is SUCCESS and a test runner is provided
-        metrics["exit_code"] = agent_proc.returncode
         if agent_proc.returncode != 0:
             outcome = RunOutcome.AGENT_ERROR
             metrics["stopReason"] = "AGENT_ERROR"
         elif metrics.get("stopReason") == "SUCCESS":
             if execute_tests is None:
-                # Tests are explicitly skipped
                 outcome = RunOutcome.SUCCESS
             else:
                 try:
-                    test_cp = execute_tests(project_path, worktree_path)
-                    tests_failed = (test_cp.returncode != 0)
-                    if tests_failed:
+                    try:
+                        test_cp = execute_tests(project_path, worktree_path, env, task.properties)
+                    except TypeError:
+                        test_cp = execute_tests(project_path, worktree_path, env)
+                    if test_cp.returncode != 0:
                         metrics["stopReason"] = "HARNESS_TESTS_FAILED"
                         outcome = RunOutcome.TESTS_FAILED
                     else:
@@ -281,31 +337,31 @@ def _run_one_task(
                     outcome = RunOutcome.TESTS_FAILED
                     metrics["stopReason"] = f"HARNESS_EXECUTION_ERROR: {exc}"
                 finally:
-                    # Ensure tests log existence for aggregation
                     if not tests_log_path.exists():
                         print("execute_tests did not create tests.txt; logging an error.", file=sys.stderr)
         else:
-            # stopReason is set to something other than success, leave it alone
             outcome = RunOutcome.AGENT_FAILED
 
-        # Persist metrics JSON (even if minimal) to support retry heuristics
         with open(results_path, "w", encoding="utf-8") as res_fp:
             json.dump(metrics, res_fp, indent=2)
             res_fp.write("\n")
 
-        # Aggregate logs
         log_paths = [agent_log_path]
         if tests_log_path.exists():
             log_paths.append(tests_log_path)
         _write_run_output(log_paths)
 
-        # Archive and cleanup
-        zip_path = archive.archive_worktree(project_path, worktree_path, pre_agent_head=pre_agent_head)
+        try:
+            zip_path = archive.archive_worktree(project_path, worktree_path, pre_agent_head=pre_agent_head)
+        except Exception:
+            zip_path = None
+        _log_stage(f"Archived worktree to {zip_path}")
 
         return RunResult(outcome=outcome, metrics=metrics, archive=zip_path, patch=patch_text)
 
     except Exception:
-        # On unexpected exceptions, attempt to archive whatever exists and re-raise
+        _append_task_log(bootstrap_log_path, "Unhandled exception in task execution")
+        _append_task_log(bootstrap_log_path, traceback.format_exc())
         try:
             archive.archive_worktree(project_path, worktree_path, pre_agent_head=pre_agent_head)
         except Exception:
@@ -314,31 +370,25 @@ def _run_one_task(
 
 
 def _run_with_retries(
-    project: str,
     task: Task,
     results_root: pathlib.Path,
     jvm_args: list[str],
     stagger_seconds: int,
     get_cli_args: Callable[[Task], list[str]],
-    execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess] | None,
-    commit_tests: Callable[[pathlib.Path, pathlib.Path, str], None] | None = None,
+    execute_tests: Callable[[pathlib.Path, pathlib.Path, dict[str, str], dict[str, str] | None], subprocess.CompletedProcess]
+    | None,
+    commit_tests: Callable[[pathlib.Path, pathlib.Path, str, dict[str, str], dict[str, str] | None], None]
+    | None = None,
+    on_task_start: Callable[[Task, pathlib.Path, int], None] | None = None,
 ) -> tuple[RunResult, bool]:
-    """
-    Retry `run_one_revision` up to a maximum number of attempts under certain conditions.
-    Retries are attempted when:
-      - No metrics JSON is produced (e.g., agent crash/OOM-kill), or
-      - The metrics JSON's stopExplanation contains any of:
-        "too many open files", "check litellm logs", "ratelimiterror".
-    """
     MAX_ATTEMPTS = 3
-    project_path = pathlib.Path(project).resolve()
+    project_path = pathlib.Path(task.project).resolve()
 
     last_result: RunResult | None = None
     hit_retry_max = False
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         result = _run_one_task(
-            project=project,
             task=task,
             results_root=results_root,
             jvm_args=jvm_args,
@@ -346,10 +396,11 @@ def _run_with_retries(
             get_cli_args=get_cli_args,
             execute_tests=execute_tests,
             commit_tests=commit_tests,
+            on_task_start=on_task_start,
+            attempt=attempt,
         )
         last_result = result
 
-        # Locate the metrics file written by `run_one_revision`.
         results_dir = pathlib.Path(results_root) / f"{project_path.name}{task.run_number}"
         results_path = results_dir / task.filename()
 
@@ -359,9 +410,8 @@ def _run_with_retries(
                 with open(results_path, "r", encoding="utf-8") as fp:
                     metrics = json.load(fp)
             except Exception:
-                metrics = None  # Treat unreadable/broken as missing
+                metrics = None
 
-        # Decide whether to retry
         should_retry = False
         reason_for_retry = None
 
@@ -379,7 +429,10 @@ def _run_with_retries(
                 reason_for_retry = stop_expl
 
         if should_retry and attempt < MAX_ATTEMPTS:
-            print(f"Automatically retrying (attempt {attempt + 1}/{MAX_ATTEMPTS}) based on {reason_for_retry}", file=sys.stderr)
+            print(
+                f"Automatically retrying (attempt {attempt + 1}/{MAX_ATTEMPTS}) based on {reason_for_retry}",
+                file=sys.stderr,
+            )
             continue
         if should_retry:
             hit_retry_max = True
@@ -389,46 +442,38 @@ def _run_with_retries(
     return last_result, hit_retry_max
 
 
-def run_many_jobs(
-    project: str,
-    results_root: pathlib.Path,
-    threads: int,
-    jobs: list[tuple[str, str, int]],  # (revision, model, run_number)
-    jvm_args: list[str],
-    stagger_seconds: int,
-    get_cli_args: Callable[[Task], list[str]],
-    execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess] | None,
-    commit_tests: Callable[[pathlib.Path, pathlib.Path, str], None] | None = None,
-) -> dict[Task, RunResult]:
-    return run_many_tasks(
-        project=project,
-        results_root=results_root,
-        threads=threads,
-        tasks=[Task(revision=rev, model=model, run_number=run_number) for (rev, model, run_number) in jobs],
-        jvm_args=jvm_args,
-        stagger_seconds=stagger_seconds,
-        get_cli_args=get_cli_args,
-        execute_tests=execute_tests,
-        commit_tests=commit_tests)
-
 def run_many_tasks(
-    project: str,
+    *,
+    tasks: list[Task],
     results_root: pathlib.Path,
     threads: int,
-    tasks: list[Task],  # (revision, model, run_number, task_id)
     jvm_args: list[str],
     stagger_seconds: int,
     get_cli_args: Callable[[Task], list[str]],
-    execute_tests: Callable[[pathlib.Path, pathlib.Path], subprocess.CompletedProcess] | None,
-    commit_tests: Callable[[pathlib.Path, pathlib.Path, str], None] | None = None,
+    execute_tests: Callable[[pathlib.Path, pathlib.Path, dict[str, str], dict[str, str] | None], subprocess.CompletedProcess]
+    | None,
+    commit_tests: Callable[[pathlib.Path, pathlib.Path, str, dict[str, str], dict[str, str] | None], None]
+    | None = None,
+    on_task_start: Callable[[Task, pathlib.Path, int], None] | None = None,
+    max_heap_mb: int | None = None,
 ) -> dict[Task, RunResult]:
     """
-    Run multiple jobs concurrently. Each job supplies callables for:
-      - get_cli_args(task)
-      - execute_tests(project_path, worktree_path) [optional: pass None to skip tests]
-      - commit_tests(project_path, worktree_path, revision) [optional]
-    Returns a mapping Task -> RunResult.
+    Run tasks concurrently using a thread pool.
+
+    Parameters match the front-end runner expectations:
+      - tasks: list[Task] (each Task includes its project path and per-task env)
+      - threads: max concurrent processes
+      - max_heap_mb: optional global heap budget across concurrent tasks, enforced using task.heap_mb
+      - get_cli_args(task): provides CLI args for the agent invocation
+      - execute_tests(project_path, worktree_path, env): optional; pass None to skip tests
+      - commit_tests(project_path, worktree_path, revision, env): optional
     """
+    if threads < 1:
+        raise ValueError("threads must be >= 1")
+
+    if not tasks:
+        return {}
+
     os.environ["BRK_COLLECT_METRICS"] = "true"
 
     results_map: dict[Task, RunResult] = {}
@@ -436,10 +481,9 @@ def run_many_tasks(
     retry_gave_up_by_model: dict[str, set[str]] = defaultdict(set)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-        future_to_job = {
+        future_to_task = {
             executor.submit(
                 _run_with_retries,
-                project,
                 task,
                 results_root,
                 jvm_args,
@@ -447,36 +491,23 @@ def run_many_tasks(
                 get_cli_args,
                 execute_tests,
                 commit_tests,
+                on_task_start,
             ): task
             for task in tasks
         }
-        try:
-            for future in concurrent.futures.as_completed(future_to_job):
-                task = future_to_job[future]
-                try:
-                    res, hit_retry_max = future.result()
-                    results_map[task] = res
-                    if res.outcome == RunOutcome.SUCCESS:
-                        successful_tasks_by_model[task.model].add(task.revision)
-                    elif hit_retry_max:
-                        retry_gave_up_by_model[task.model].add(task.revision)
-                except Exception as exc:
-                    print(
-                        f"Fatal error while processing revision '{task.revision}' with model '{task.model}' (run {task.run_number}, task '{task.task_id}'): {exc}",
-                        file=sys.stderr,
-                    )
-                    raise
-        finally:
-            executor.shutdown(wait=True)
+        for future in concurrent.futures.as_completed(future_to_task):
+            task = future_to_task[future]
+            res, hit_retry_max = future.result()
+            results_map[task] = res
+            if res.outcome == RunOutcome.SUCCESS:
+                successful_tasks_by_model[task.model].add(task.revision)
+            elif hit_retry_max:
+                retry_gave_up_by_model[task.model].add(task.revision)
 
     if successful_tasks_by_model:
         print("\n--- Successful tasks per model (at least one run) ---", file=sys.stderr)
-        model_counts = {
-            model: len(revs) for model, revs in successful_tasks_by_model.items()
-        }
-        sorted_models = sorted(
-            model_counts.items(), key=lambda item: item[1], reverse=True
-        )
+        model_counts = {model: len(revs) for model, revs in successful_tasks_by_model.items()}
+        sorted_models = sorted(model_counts.items(), key=lambda item: item[1], reverse=True)
         for model, count in sorted_models:
             print(f"{model}: {count}", file=sys.stderr)
 
