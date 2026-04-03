@@ -8,6 +8,7 @@ import random
 import shutil
 import subprocess
 import sys
+import threading
 import traceback
 import time
 from collections import defaultdict
@@ -56,12 +57,35 @@ class Task:
     task_id: str | None = None
     job_env: dict[str, str] | None = field(default=None, compare=False, hash=False, repr=False)
     heap_mb: int = field(default=0, compare=False, hash=False, repr=False)
+    jvm_args: list[str] | None = field(default=None, compare=False, hash=False, repr=False)
     properties: dict[str, str] | None = field(default=None, compare=False, hash=False, repr=False)
 
     def filename(self) -> str:
         if self.task_id:
             return f"{self.model}-{self.revision}-{self.task_id}.json"
         return f"{self.model}-{self.revision}.json"
+
+
+class HeapBudget:
+    def __init__(self, max_mb: int):
+        self._max = max_mb
+        self._used = 0
+        self._cond = threading.Condition()
+
+    def acquire(self, mb: int) -> None:
+        weight = max(0, int(mb))
+        with self._cond:
+            while self._used + weight > self._max:
+                self._cond.wait()
+            self._used += weight
+
+    def release(self, mb: int) -> None:
+        weight = max(0, int(mb))
+        with self._cond:
+            self._used -= weight
+            if self._used < 0:
+                self._used = 0
+            self._cond.notify_all()
 
 
 def _resolve_cli_bin() -> pathlib.Path:
@@ -141,6 +165,43 @@ def _append_task_log(log_path: pathlib.Path, message: str) -> None:
     except Exception:
         # Never fail task execution because of logging problems.
         pass
+
+
+def _parse_agent_metrics(agent_log_path: pathlib.Path, worktree_path: pathlib.Path) -> dict | None:
+    metrics_line = None
+    metrics_key = None
+    accepted_prefixes = ("BRK_CODEAGENT_METRICS=", "BRK_SEARCHAGENT_METRICS=")
+
+    with open(agent_log_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            stripped = line.strip()
+            for prefix in accepted_prefixes:
+                if stripped.startswith(prefix):
+                    metrics_line = stripped
+                    metrics_key = prefix[:-1]
+                    break
+
+    if metrics_line is None:
+        return None
+
+    payload = metrics_line.split("=", 1)[1]
+    try:
+        metrics = json.loads(payload)
+    except Exception:
+        return None
+
+    if not isinstance(metrics, dict):
+        return None
+
+    metrics["worktree"] = str(worktree_path)
+    metrics.setdefault("metricsType", metrics_key)
+    if "stopReason" not in metrics and "stop_reason" in metrics:
+        metrics["stopReason"] = metrics["stop_reason"]
+    if "stopExplanation" not in metrics and "failure_type" in metrics:
+        failure_type = metrics.get("failure_type")
+        if isinstance(failure_type, str):
+            metrics["stopExplanation"] = failure_type
+    return metrics
 
 
 def _run_one_task(
@@ -258,104 +319,90 @@ def _run_one_task(
             _git_generic(worktree_path, "reset", "--hard", f"{task.revision}^")
             head_before = _git_generic(worktree_path, "rev-parse", "HEAD")
             print(f"Checked out revision {task.revision}^ ({head_before[:7]})", file=sys.stderr)
-            if commit_tests is None:
-                raise RuntimeError("commit_tests callback is required for this execution mode")
+
+            _log_stage("Running commit_tests callback")
             try:
-                commit_tests(project_path, worktree_path, task.revision, env, task.properties)
+                if task.properties is not None:
+                    commit_tests(project_path, worktree_path, task.revision, env, task.properties)
+                else:
+                    commit_tests(project_path, worktree_path, task.revision, env)
             except TypeError:
                 commit_tests(project_path, worktree_path, task.revision, env)
-            head_after = _git_generic(worktree_path, "rev-parse", "HEAD")
-            if head_before == head_after:
-                raise ValueError("commit_tests did not create a new HEAD commit as required.")
-            print(f"After commit_tests, HEAD is at {head_after[:7]}", file=sys.stderr)
-            tests_diff = _git_generic(worktree_path, "show", "HEAD")
-            with open(worktree_path / "01-tests.diff", "w", encoding="utf-8") as fp:
-                fp.write(tests_diff)
-            pre_agent_head = head_after
+            pre_agent_head = _git_generic(worktree_path, "rev-parse", "HEAD")
+            print(f"Commit tests complete, HEAD at {pre_agent_head[:7]}", file=sys.stderr)
 
-        agent_args = list(get_cli_args(task) or [])
-        _log_stage(f"Agent args: {agent_args}")
-        second_cmd: list[str] = [
+        cli_args = get_cli_args(task)
+        _log_stage(f"Second cli args: {' '.join(cli_args)}")
+        second_cmd = [
             str(cli_bin),
             *jvm_args,
             f"--project={project_path}",
             f"--worktree={worktree_path}",
-            *agent_args,
+            *cli_args,
         ]
-        _log_stage(f"Second cli command: {' '.join(second_cmd)}")
-        agent_proc = _run_cli(second_cmd, agent_log_path, env=env)
-        _log_stage(f"Second cli return code: {agent_proc.returncode}")
+        second_ret = _run_cli(second_cmd, agent_log_path, env=env)
+        _log_stage(f"Second cli return code: {second_ret.returncode}")
+        if second_ret.returncode != 0:
+            _log_stage(f"Second cli failed with return code {second_ret.returncode}")
+            _write_run_output([agent_log_path])
+            try:
+                zip_path = archive.archive_worktree(project_path, worktree_path, pre_agent_head=pre_agent_head)
+            except Exception:
+                zip_path = None
+            return RunResult(RunOutcome.AGENT_FAILED, metrics=None, archive=zip_path, patch="")
 
-        code_metrics_json: str | None = None
-        search_metrics_json: str | None = None
-        if agent_log_path.exists():
-            with open(agent_log_path, "r", encoding="utf-8") as log_fp:
-                for line in log_fp:
-                    if line.startswith("BRK_CODEAGENT_METRICS="):
-                        code_metrics_json = line.strip().split("=", 1)[1]
-                    elif line.startswith("BRK_SEARCHAGENT_METRICS="):
-                        search_metrics_json = line.strip().split("=", 1)[1]
+        metrics = _parse_agent_metrics(agent_log_path, worktree_path)
+        if metrics is None:
+            _log_stage("No supported metrics line found in agent log")
 
-        metrics_json = code_metrics_json or search_metrics_json
-        metrics: dict = json.loads(metrics_json) if metrics_json else {"stopReason": "UNKNOWN"}
-        metrics["worktree"] = str(worktree_path)
-        metrics["exit_code"] = agent_proc.returncode
+        tests_failed = False
+        if execute_tests is not None:
+            _log_stage("Running execute_tests callback")
+            try:
+                try:
+                    if task.properties is not None:
+                        test_cp = execute_tests(project_path, worktree_path, env, task.properties)
+                    else:
+                        test_cp = execute_tests(project_path, worktree_path, env)
+                except TypeError:
+                    test_cp = execute_tests(project_path, worktree_path, env)
+                with open(tests_log_path, "wb") as tf:
+                    tf.write((test_cp.stdout or "").encode(errors="replace"))
+                    tf.write((test_cp.stderr or "").encode(errors="replace"))
+                tests_failed = test_cp.returncode != 0
+            except Exception:
+                tests_failed = True
 
         patch_text = ""
-        if agent_proc.returncode == 0:
-            _git_generic(worktree_path, "add", "-A")
-            _git_generic(worktree_path, "commit", "--allow-empty", "-m", "Agent work")
-            patch_text = _git_generic(worktree_path, "show", "HEAD")
-        else:
-            try:
-                patch_text = _git_generic(worktree_path, "diff")
-            except subprocess.CalledProcessError:
-                patch_text = ""
+        try:
+            if pre_agent_head:
+                patch_text = _git_generic(worktree_path, "diff", f"{pre_agent_head}..HEAD")
+        except Exception:
+            patch_text = ""
 
         results_dir = pathlib.Path(results_root) / f"{project_path.name}{task.run_number}"
         results_dir.mkdir(parents=True, exist_ok=True)
         results_path = results_dir / task.filename()
 
-        if agent_proc.returncode != 0:
-            outcome = RunOutcome.AGENT_ERROR
-            metrics["stopReason"] = "AGENT_ERROR"
-        elif metrics.get("stopReason") == "SUCCESS":
-            if execute_tests is None:
-                outcome = RunOutcome.SUCCESS
-            else:
-                try:
-                    try:
-                        test_cp = execute_tests(project_path, worktree_path, env, task.properties)
-                    except TypeError:
-                        test_cp = execute_tests(project_path, worktree_path, env)
-                    if test_cp.returncode != 0:
-                        metrics["stopReason"] = "HARNESS_TESTS_FAILED"
-                        outcome = RunOutcome.TESTS_FAILED
-                    else:
-                        outcome = RunOutcome.SUCCESS
-                except Exception as exc:
-                    outcome = RunOutcome.TESTS_FAILED
-                    metrics["stopReason"] = f"HARNESS_EXECUTION_ERROR: {exc}"
-                finally:
-                    if not tests_log_path.exists():
-                        print("execute_tests did not create tests.txt; logging an error.", file=sys.stderr)
-        else:
+        outcome = RunOutcome.SUCCESS
+        if metrics is None:
             outcome = RunOutcome.AGENT_FAILED
+        elif tests_failed:
+            outcome = RunOutcome.TESTS_FAILED
 
-        with open(results_path, "w", encoding="utf-8") as res_fp:
-            json.dump(metrics, res_fp, indent=2)
-            res_fp.write("\n")
+        if isinstance(metrics, dict):
+            try:
+                with open(results_path, "w", encoding="utf-8") as fp:
+                    json.dump(metrics, fp, indent=2)
+                    fp.write("\n")
+            except Exception:
+                _log_stage(f"Failed to write metrics file: {results_path}")
 
-        log_paths = [agent_log_path]
-        if tests_log_path.exists():
-            log_paths.append(tests_log_path)
-        _write_run_output(log_paths)
-
+        _write_run_output([agent_log_path, tests_log_path])
         try:
             zip_path = archive.archive_worktree(project_path, worktree_path, pre_agent_head=pre_agent_head)
         except Exception:
             zip_path = None
-        _log_stage(f"Archived worktree to {zip_path}")
 
         return RunResult(outcome=outcome, metrics=metrics, archive=zip_path, patch=patch_text)
 
@@ -476,25 +523,66 @@ def run_many_tasks(
 
     os.environ["BRK_COLLECT_METRICS"] = "true"
 
+    if max_heap_mb is not None and max_heap_mb < 1:
+        raise ValueError("max_heap_mb must be >= 1")
+
+    if max_heap_mb is not None:
+        oversized = [task for task in tasks if task.heap_mb > 0 and task.heap_mb > max_heap_mb]
+        if oversized:
+            first = oversized[0]
+            raise ValueError(
+                f"Task heap_mb={first.heap_mb} exceeds max_heap_mb={max_heap_mb} "
+                f"for {first.project}:{first.revision}/{first.model}/{first.run_number}"
+            )
+
+    heap_budget = HeapBudget(max_heap_mb) if max_heap_mb is not None else None
+
     results_map: dict[Task, RunResult] = {}
     successful_tasks_by_model: dict[str, set[str]] = defaultdict(set)
     retry_gave_up_by_model: dict[str, set[str]] = defaultdict(set)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-        future_to_task = {
-            executor.submit(
-                _run_with_retries,
+    def _effective_jvm_args(task: Task) -> list[str]:
+        if task.jvm_args is None:
+            return jvm_args
+        return list(task.jvm_args)
+
+    def _heap_aware_wrapper(task: Task) -> tuple[RunResult, bool]:
+        assert heap_budget is not None
+        weight = max(0, int(task.heap_mb))
+        heap_budget.acquire(weight)
+        try:
+            return _run_with_retries(
                 task,
                 results_root,
-                jvm_args,
+                _effective_jvm_args(task),
                 stagger_seconds,
                 get_cli_args,
                 execute_tests,
                 commit_tests,
                 on_task_start,
-            ): task
-            for task in tasks
-        }
+            )
+        finally:
+            heap_budget.release(weight)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+        future_to_task: dict[concurrent.futures.Future, Task] = {}
+        for task in tasks:
+            if heap_budget is None:
+                future = executor.submit(
+                    _run_with_retries,
+                    task,
+                    results_root,
+                    _effective_jvm_args(task),
+                    stagger_seconds,
+                    get_cli_args,
+                    execute_tests,
+                    commit_tests,
+                    on_task_start,
+                )
+            else:
+                future = executor.submit(_heap_aware_wrapper, task)
+            future_to_task[future] = task
+
         for future in concurrent.futures.as_completed(future_to_task):
             task = future_to_task[future]
             res, hit_retry_max = future.result()
