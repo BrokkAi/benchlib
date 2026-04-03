@@ -66,6 +66,10 @@ def cleanup_worktree(project_path: pathlib.Path, worktree_path: pathlib.Path):
             logger.error(f"Error deleting agent log {agent_log_path}: {e}")
 
 
+def _archive_root() -> pathlib.Path:
+    return pathlib.Path.home() / "brokkbench-archive"
+
+
 def archive_worktree(
     project_path: pathlib.Path,
     worktree_path: pathlib.Path,
@@ -93,7 +97,9 @@ def archive_worktree(
         llm_history_dir = worktree_path / ".brokk" / "llm-history"
         tests_diff_path = worktree_path / "01-tests.diff"
 
-        zip_path = worktree_path.parent / f"{worktree_path.name}.zip"
+        archive_dir = _archive_root() / project_path.name
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = archive_dir / f"{worktree_path.name}.zip"
         logger.info(f"Archiving worktree {worktree_path} to {zip_path}")
 
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:

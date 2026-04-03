@@ -104,3 +104,35 @@ def test_run_many_tasks_process_mode_smoke(tmp_path: pathlib.Path) -> None:
     data = result_file.read_text(encoding="utf-8")
     assert "SUCCESS" in data
     assert "worktree" in data
+
+
+def test_archive_worktree_writes_zip_to_archive_root(tmp_path: pathlib.Path, monkeypatch) -> None:
+    import benchlib.archive  # noqa: E402
+
+    project = tmp_path / "repo"
+    project.mkdir(parents=True, exist_ok=True)
+
+    subprocess.check_call(["git", "init"], cwd=project)
+    subprocess.check_call(["git", "config", "user.email", "test@example.com"], cwd=project)
+    subprocess.check_call(["git", "config", "user.name", "Test User"], cwd=project)
+
+    (project / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.check_call(["git", "add", "README.md"], cwd=project)
+    subprocess.check_call(["git", "commit", "-m", "init"], cwd=project)
+
+    worktree = tmp_path / "brokkbench" / project.name / "wt-1"
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.check_call(["git", "-C", str(project), "worktree", "add", "--detach", str(worktree)])
+
+    (worktree / "run-output.txt").write_text("output\n", encoding="utf-8")
+    llm_history = worktree / ".brokk" / "llm-history"
+    llm_history.mkdir(parents=True, exist_ok=True)
+    (llm_history / "session.log").write_text("history\n", encoding="utf-8")
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(pathlib.Path, "home", lambda: fake_home)
+
+    zip_path = benchlib.archive.archive_worktree(project, worktree, pre_agent_head=None)
+
+    expected_path = fake_home / "brokkbench-archive" / project.name / f"{worktree.name}.zip"
