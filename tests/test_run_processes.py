@@ -359,3 +359,106 @@ def test_run_many_tasks_preserves_live_worktree_in_json_when_archive_fails(
     data = json.loads(result_file.read_text(encoding="utf-8"))
     assert data["stopReason"] == "SUCCESS"
     assert data["worktree"] == str(seen_worktrees[0])
+
+
+def test_run_many_tasks_treats_no_edits_as_agent_failed_and_skips_tests(tmp_path: pathlib.Path) -> None:
+    project = tmp_path / "repo"
+    project.mkdir(parents=True, exist_ok=True)
+
+    subprocess.check_call(["git", "init"], cwd=project)
+    subprocess.check_call(["git", "config", "user.email", "test@example.com"], cwd=project)
+    subprocess.check_call(["git", "config", "user.name", "Test User"], cwd=project)
+
+    (project / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.check_call(["git", "add", "README.md"], cwd=project)
+    subprocess.check_call(["git", "commit", "-m", "init"], cwd=project)
+
+    rev = _git(project, "rev-parse", "HEAD")
+
+    fake_cli = tmp_path / "fake_cli_no_edits.py"
+    fake_cli.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import pathlib",
+                "import subprocess",
+                "import sys",
+                "",
+                "def main() -> int:",
+                "    project = None",
+                "    worktree = None",
+                "    for a in sys.argv[1:]:",
+                "        if a.startswith('--project='):",
+                "            project = a.split('=', 1)[1]",
+                "        elif a.startswith('--worktree='):",
+                "            worktree = a.split('=', 1)[1]",
+                "    if project and worktree:",
+                "        wt = pathlib.Path(worktree)",
+                "        if not wt.exists():",
+                "            wt.parent.mkdir(parents=True, exist_ok=True)",
+                "            subprocess.check_call(['git', '-C', project, 'worktree', 'add', '--detach', worktree])",
+                "    sys.stdout.write('BRK_CODEAGENT_METRICS={\"stopReason\":\"NO_EDITS\",\"elapsedMillis\":1,\"llmMillis\":1}\\n')",
+                "    return 0",
+                "",
+                "if __name__ == '__main__':",
+                "    raise SystemExit(main())",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_cli.chmod(0o755)
+
+    old_cli_bin = os.environ.get("BRK_CLI_BIN")
+    os.environ["BRK_CLI_BIN"] = str(fake_cli)
+    execute_tests_called = False
+
+    def get_cli_args(_task: benchlib.run.Task) -> list[str]:
+        return []
+
+    def execute_tests(
+        _project_path: pathlib.Path,
+        worktree_path: pathlib.Path,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess:
+        nonlocal execute_tests_called
+        execute_tests_called = True
+        log_path = worktree_path / "tests.txt"
+        log_path.write_text("should not run\n", encoding="utf-8")
+        return subprocess.run(["/bin/true"], env=env, cwd=worktree_path)
+
+    results_root = tmp_path / "results"
+
+    t = benchlib.run.Task(
+        project=str(project),
+        revision=rev,
+        model="dummy",
+        run_number=1,
+        heap_mb=1,
+    )
+
+    try:
+        results = benchlib.run.run_many_tasks(
+            tasks=[t],
+            results_root=results_root,
+            threads=1,
+            jvm_args=[],
+            stagger_seconds=0,
+            get_cli_args=get_cli_args,
+            execute_tests=execute_tests,
+            commit_tests=None,
+            max_heap_mb=8,
+        )
+    finally:
+        if old_cli_bin is None:
+            os.environ.pop("BRK_CLI_BIN", None)
+        else:
+            os.environ["BRK_CLI_BIN"] = old_cli_bin
+
+    assert execute_tests_called is False
+    assert t in results
+    assert results[t].outcome == benchlib.run.RunOutcome.AGENT_FAILED
+
+    result_file = results_root / f"{project.name}1" / f"{t.model}-{t.revision}.json"
+    data = json.loads(result_file.read_text(encoding="utf-8"))
+    assert data["stopReason"] == "NO_EDITS"

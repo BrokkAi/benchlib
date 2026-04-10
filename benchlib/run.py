@@ -204,6 +204,13 @@ def _parse_agent_metrics(agent_log_path: pathlib.Path, worktree_path: pathlib.Pa
     return metrics
 
 
+def _stop_reason(metrics: dict | None) -> str | None:
+    if not isinstance(metrics, dict):
+        return None
+    stop_reason = metrics.get("stopReason")
+    return stop_reason if isinstance(stop_reason, str) else None
+
+
 def _run_one_task(
     task: Task,
     results_root: pathlib.Path,
@@ -355,8 +362,9 @@ def _run_one_task(
         if metrics is None:
             _log_stage("No supported metrics line found in agent log")
 
+        stop_reason = _stop_reason(metrics)
         tests_failed = False
-        if execute_tests is not None:
+        if execute_tests is not None and stop_reason == "SUCCESS":
             _log_stage("Running execute_tests callback")
             try:
                 try:
@@ -386,6 +394,8 @@ def _run_one_task(
 
         outcome = RunOutcome.SUCCESS
         if metrics is None:
+            outcome = RunOutcome.AGENT_FAILED
+        elif stop_reason != "SUCCESS":
             outcome = RunOutcome.AGENT_FAILED
         elif tests_failed:
             outcome = RunOutcome.TESTS_FAILED
