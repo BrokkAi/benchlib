@@ -390,19 +390,22 @@ def _run_one_task(
         elif tests_failed:
             outcome = RunOutcome.TESTS_FAILED
 
-        if isinstance(metrics, dict):
-            try:
-                with open(results_path, "w", encoding="utf-8") as fp:
-                    json.dump(metrics, fp, indent=2)
-                    fp.write("\n")
-            except Exception:
-                _log_stage(f"Failed to write metrics file: {results_path}")
-
         _write_run_output([agent_log_path, tests_log_path])
         try:
             zip_path = archive.archive_worktree(project_path, worktree_path, pre_agent_head=pre_agent_head)
         except Exception:
             zip_path = None
+
+        if isinstance(metrics, dict):
+            persisted_metrics = dict(metrics)
+            if zip_path is not None:
+                persisted_metrics["worktree"] = str(zip_path)
+            try:
+                with open(results_path, "w", encoding="utf-8") as fp:
+                    json.dump(persisted_metrics, fp, indent=2)
+                    fp.write("\n")
+            except Exception:
+                _log_stage(f"Failed to write metrics file: {results_path}")
 
         return RunResult(outcome=outcome, metrics=metrics, archive=zip_path, patch=patch_text)
 

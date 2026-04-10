@@ -1,3 +1,4 @@
+import json
 import os
 import pathlib
 import subprocess
@@ -102,9 +103,12 @@ def test_run_many_tasks_process_mode_smoke(tmp_path: pathlib.Path) -> None:
 
     result_file = results_root / f"{project.name}1" / f"{t.model}-{t.revision}.json"
     assert result_file.exists()
-    data = result_file.read_text(encoding="utf-8")
-    assert "SUCCESS" in data
-    assert "worktree" in data
+    data = json.loads(result_file.read_text(encoding="utf-8"))
+    assert data["stopReason"] == "SUCCESS"
+    assert data["worktree"].endswith(".zip")
+    assert "brokkbench-archive" in data["worktree"]
+    assert results[t].archive is not None
+    assert data["worktree"] == str(results[t].archive)
 
 
 def test_run_many_tasks_accepts_searchagent_metrics(tmp_path: pathlib.Path) -> None:
@@ -231,3 +235,114 @@ def test_archive_worktree_writes_zip_to_archive_root(tmp_path: pathlib.Path, mon
     assert zip_path == expected_path
     assert expected_path.exists()
     assert not worktree.exists()
+
+
+def test_run_many_tasks_preserves_live_worktree_in_json_when_archive_fails(
+    tmp_path: pathlib.Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "repo"
+    project.mkdir(parents=True, exist_ok=True)
+
+    subprocess.check_call(["git", "init"], cwd=project)
+    subprocess.check_call(["git", "config", "user.email", "test@example.com"], cwd=project)
+    subprocess.check_call(["git", "config", "user.name", "Test User"], cwd=project)
+
+    (project / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.check_call(["git", "add", "README.md"], cwd=project)
+    subprocess.check_call(["git", "commit", "-m", "init"], cwd=project)
+
+    rev = _git(project, "rev-parse", "HEAD")
+
+    fake_cli = tmp_path / "fake_cli.py"
+    fake_cli.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import pathlib",
+                "import subprocess",
+                "import sys",
+                "",
+                "project = None",
+                "worktree = None",
+                "for a in sys.argv[1:]:",
+                "    if a.startswith('--project='):",
+                "        project = a.split('=', 1)[1]",
+                "    elif a.startswith('--worktree='):",
+                "        worktree = a.split('=', 1)[1]",
+                "if project and worktree:",
+                "    wt = pathlib.Path(worktree)",
+                "    if not (wt / '.git').exists():",
+                "        wt.parent.mkdir(parents=True, exist_ok=True)",
+                "        subprocess.check_call(['git', '-C', project, 'worktree', 'add', '--detach', worktree])",
+                "sys.stdout.write('BRK_CODEAGENT_METRICS={\"stopReason\":\"SUCCESS\",\"elapsedMillis\":1,\"llmMillis\":1}\\n')",
+                "sys.exit(0)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_cli.chmod(0o755)
+    old_cli_bin = os.environ.get("BRK_CLI_BIN")
+    os.environ["BRK_CLI_BIN"] = str(fake_cli)
+
+    def get_cli_args(_task: benchlib.run.Task) -> list[str]:
+        return []
+
+    def execute_tests(
+        _project_path: pathlib.Path,
+        worktree_path: pathlib.Path,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess:
+        log_path = worktree_path / "tests.txt"
+        log_path.write_text("ok\n", encoding="utf-8")
+        return subprocess.run(["/bin/true"], env=env, cwd=worktree_path)
+
+    def raising_archive(
+        _project_path: pathlib.Path,
+        _worktree_path: pathlib.Path,
+        pre_agent_head: str | None = None,
+    ) -> pathlib.Path | None:
+        raise RuntimeError("archive failed")
+
+    monkeypatch.setattr(benchlib.archive, "archive_worktree", raising_archive)
+
+    results_root = tmp_path / "results"
+    t = benchlib.run.Task(project=str(project), revision=rev, model="fake", run_number=1)
+    seen_worktrees: list[pathlib.Path] = []
+
+    def on_task_start(
+        _task: benchlib.run.Task,
+        worktree_path: pathlib.Path,
+        _attempt: int,
+    ) -> None:
+        seen_worktrees.append(worktree_path)
+
+    try:
+        results = benchlib.run.run_many_tasks(
+            tasks=[t],
+            results_root=results_root,
+            threads=1,
+            jvm_args=[],
+            stagger_seconds=0,
+            get_cli_args=get_cli_args,
+            execute_tests=execute_tests,
+            commit_tests=None,
+            max_heap_mb=8,
+            on_task_start=on_task_start,
+        )
+    finally:
+        if old_cli_bin is None:
+            os.environ.pop("BRK_CLI_BIN", None)
+        else:
+            os.environ["BRK_CLI_BIN"] = old_cli_bin
+
+    assert len(seen_worktrees) == 1
+    assert t in results
+    assert results[t].outcome == benchlib.run.RunOutcome.SUCCESS
+    assert results[t].archive is None
+
+    result_file = results_root / f"{project.name}1" / f"{t.model}-{t.revision}.json"
+    assert result_file.exists()
+    data = json.loads(result_file.read_text(encoding="utf-8"))
+    assert data["stopReason"] == "SUCCESS"
+    assert data["worktree"] == str(seen_worktrees[0])
