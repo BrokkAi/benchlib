@@ -267,7 +267,7 @@ def _run_one_task(
     pre_agent_head: str | None = None
     bootstrap_log_path = worktree_path.parent / f"{workdir_name}-bootstrap.txt"
     agent_log_path = worktree_path.parent / f"{workdir_name}-agent.txt"
-    tests_log_path = worktree_path / "tests.txt"
+    tests_log_path = worktree_path.parent / f"{workdir_name}-harness-tests.txt"
 
     def _log_stage(message: str) -> None:
         _append_task_log(bootstrap_log_path, message)

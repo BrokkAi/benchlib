@@ -48,7 +48,7 @@ def _git_generic(root: pathlib.Path, *git_args: str) -> subprocess.CompletedProc
 
 
 def cleanup_worktree(project_path: pathlib.Path, worktree_path: pathlib.Path):
-    """Force-deletes a git worktree and its associated agent log."""
+    """Force-deletes a git worktree and its associated sidecar logs."""
     if worktree_path.exists():
         logger.info(f"Cleaning up worktree {worktree_path}")
     try:
@@ -64,6 +64,18 @@ def cleanup_worktree(project_path: pathlib.Path, worktree_path: pathlib.Path):
             agent_log_path.unlink()
         except OSError as e:
             logger.error(f"Error deleting agent log {agent_log_path}: {e}")
+    bootstrap_log_path = worktree_path.parent / f"{worktree_path.name}-bootstrap.txt"
+    if bootstrap_log_path.exists():
+        try:
+            bootstrap_log_path.unlink()
+        except OSError as e:
+            logger.error(f"Error deleting bootstrap log {bootstrap_log_path}: {e}")
+    harness_tests_log_path = worktree_path.parent / f"{worktree_path.name}-harness-tests.txt"
+    if harness_tests_log_path.exists():
+        try:
+            harness_tests_log_path.unlink()
+        except OSError as e:
+            logger.error(f"Error deleting harness tests log {harness_tests_log_path}: {e}")
 
 
 def _archive_root() -> pathlib.Path:
@@ -96,6 +108,8 @@ def archive_worktree(
         run_output = worktree_path / "run-output.txt"
         llm_history_dir = worktree_path / ".brokk" / "llm-history"
         tests_diff_path = worktree_path / "01-tests.diff"
+        bootstrap_log_path = worktree_path.parent / f"{worktree_path.name}-bootstrap.txt"
+        harness_tests_log_path = worktree_path.parent / f"{worktree_path.name}-harness-tests.txt"
 
         archive_dir = _archive_root() / project_path.name
         archive_dir.mkdir(parents=True, exist_ok=True)
@@ -122,6 +136,12 @@ def archive_worktree(
             # 01-tests.diff (if present)
             if tests_diff_path.exists():
                 zf.write(tests_diff_path, arcname="01-tests.diff")
+
+            if bootstrap_log_path.exists():
+                zf.write(bootstrap_log_path, arcname="bootstrap.txt")
+
+            if harness_tests_log_path.exists():
+                zf.write(harness_tests_log_path, arcname="harness-tests.txt")
 
             # 02-agent.diff
             agent_diff: str = ""

@@ -3,6 +3,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import zipfile
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -109,6 +110,9 @@ def test_run_many_tasks_process_mode_smoke(tmp_path: pathlib.Path) -> None:
     assert "brokkbench-archive" in data["worktree"]
     assert results[t].archive is not None
     assert data["worktree"] == str(results[t].archive)
+    with zipfile.ZipFile(results[t].archive) as zf:
+        assert "bootstrap.txt" in zf.namelist()
+        assert "harness-tests.txt" in zf.namelist()
 
 
 def test_run_many_tasks_accepts_searchagent_metrics(tmp_path: pathlib.Path) -> None:
@@ -224,6 +228,10 @@ def test_archive_worktree_writes_zip_to_archive_root(tmp_path: pathlib.Path, mon
     llm_history = worktree / ".brokk" / "llm-history"
     llm_history.mkdir(parents=True, exist_ok=True)
     (llm_history / "session.log").write_text("history\n", encoding="utf-8")
+    bootstrap_log = worktree.parent / f"{worktree.name}-bootstrap.txt"
+    bootstrap_log.write_text("bootstrap\n", encoding="utf-8")
+    harness_tests_log = worktree.parent / f"{worktree.name}-harness-tests.txt"
+    harness_tests_log.write_text("tests\n", encoding="utf-8")
 
     fake_home = tmp_path / "home"
     fake_home.mkdir()
@@ -235,6 +243,11 @@ def test_archive_worktree_writes_zip_to_archive_root(tmp_path: pathlib.Path, mon
     assert zip_path == expected_path
     assert expected_path.exists()
     assert not worktree.exists()
+    assert not bootstrap_log.exists()
+    assert not harness_tests_log.exists()
+    with zipfile.ZipFile(expected_path) as zf:
+        assert "bootstrap.txt" in zf.namelist()
+        assert "harness-tests.txt" in zf.namelist()
 
 
 def test_run_many_tasks_preserves_live_worktree_in_json_when_archive_fails(
