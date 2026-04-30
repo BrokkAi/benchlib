@@ -211,6 +211,17 @@ def _stop_reason(metrics: dict | None) -> str | None:
     return stop_reason if isinstance(stop_reason, str) else None
 
 
+def _normalize_metrics_stop_reason(metrics: dict | None) -> dict | None:
+    if not isinstance(metrics, dict):
+        return metrics
+    changed_files = metrics.get("changedFiles")
+    if metrics.get("stopReason") == "SUCCESS" and isinstance(changed_files, list) and len(changed_files) == 0:
+        metrics = dict(metrics)
+        metrics["stopReason"] = "NO_EDITS"
+        metrics.setdefault("stopExplanation", "Agent reported success without changing any files")
+    return metrics
+
+
 def _run_one_task(
     task: Task,
     results_root: pathlib.Path,
@@ -362,6 +373,7 @@ def _run_one_task(
         if metrics is None:
             _log_stage("No supported metrics line found in agent log")
 
+        metrics = _normalize_metrics_stop_reason(metrics)
         stop_reason = _stop_reason(metrics)
         tests_failed = False
         if execute_tests is not None and stop_reason == "SUCCESS":
