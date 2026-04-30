@@ -8,3 +8,6 @@
 !.brokk/style.md
 !.brokk/review.md
 !.brokk/project.properties
+
+__pycache__/
+*.pyc
