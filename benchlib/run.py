@@ -210,7 +210,6 @@ def _stop_reason(metrics: dict | None) -> str | None:
     stop_reason = metrics.get("stopReason")
     return stop_reason if isinstance(stop_reason, str) else None
 
-
 def _normalize_metrics_stop_reason(metrics: dict | None) -> dict | None:
     if not isinstance(metrics, dict):
         return metrics
@@ -420,6 +419,8 @@ def _run_one_task(
 
         if isinstance(metrics, dict):
             persisted_metrics = dict(metrics)
+            if stop_reason is not None:
+                persisted_metrics["stopReason"] = stop_reason
             if zip_path is not None:
                 persisted_metrics["worktree"] = str(zip_path)
             try:
