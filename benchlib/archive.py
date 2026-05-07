@@ -82,10 +82,16 @@ def _archive_root() -> pathlib.Path:
     return pathlib.Path.home() / "brokkbench-archive"
 
 
+def _sanitize_archive_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-") or "archive"
+
+
 def archive_worktree(
     project_path: pathlib.Path,
     worktree_path: pathlib.Path,
     pre_agent_head: str | None = None,
+    archive_name: str | None = None,
+    cleanup: bool = True,
 ) -> pathlib.Path | None:
     """
     Create a zip archive of a worktree's results. Includes artifacts if present:
@@ -113,7 +119,10 @@ def archive_worktree(
 
         archive_dir = _archive_root() / project_path.name
         archive_dir.mkdir(parents=True, exist_ok=True)
-        zip_path = archive_dir / f"{worktree_path.name}.zip"
+        archive_stem = worktree_path.name if archive_name is None else _sanitize_archive_name(archive_name)
+        if not archive_stem.endswith(".zip"):
+            archive_stem = f"{archive_stem}.zip"
+        zip_path = archive_dir / archive_stem
         logger.info(f"Archiving worktree {worktree_path} to {zip_path}")
 
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -167,7 +176,8 @@ def archive_worktree(
         return zip_path
 
     finally:
-        cleanup_worktree(project_path, worktree_path)
+        if cleanup:
+            cleanup_worktree(project_path, worktree_path)
 
 
 def _archive_worker(worktree_path_str: str):
