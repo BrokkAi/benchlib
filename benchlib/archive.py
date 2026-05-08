@@ -91,18 +91,14 @@ def archive_worktree(
     worktree_path: pathlib.Path,
     pre_agent_head: str | None = None,
     archive_name: str | None = None,
-    cleanup: bool = True,
 ) -> pathlib.Path | None:
     """
     Create a zip archive of a worktree's results. Includes artifacts if present:
       - run-output.txt
       - .brokk/llm-history/**
-      - 01-tests.diff if present (created by caller when tests snapshot is committed)
-      - 02-agent.diff computed as:
-          * if pre_agent_head matches current HEAD, agent did not commit -> `git diff` (bare)
-          * else `git show HEAD`
+      - .brokk/sft_gen/**
     Always cleans up the worktree afterwards. Returns the created zip Path, or None if the
-    worktree does not exist.
+    worktree does not exist. The `pre_agent_head` argument is retained for call-site compatibility.
     """
     project_path = pathlib.Path(project_path)
     worktree_path = pathlib.Path(worktree_path)
@@ -113,7 +109,7 @@ def archive_worktree(
 
         run_output = worktree_path / "run-output.txt"
         llm_history_dir = worktree_path / ".brokk" / "llm-history"
-        tests_diff_path = worktree_path / "01-tests.diff"
+        sft_gen_dir = worktree_path / ".brokk" / "sft_gen"
         bootstrap_log_path = worktree_path.parent / f"{worktree_path.name}-bootstrap.txt"
         harness_tests_log_path = worktree_path.parent / f"{worktree_path.name}-harness-tests.txt"
 
@@ -142,9 +138,13 @@ def archive_worktree(
             else:
                 logger.warning(f"{llm_history_dir} missing; continuing without it.")
 
-            # 01-tests.diff (if present)
-            if tests_diff_path.exists():
-                zf.write(tests_diff_path, arcname="01-tests.diff")
+            # .brokk/sft_gen/**
+            if sft_gen_dir.is_dir():
+                for root, _, files in os.walk(sft_gen_dir):
+                    for file in files:
+                        file_path = pathlib.Path(root) / file
+                        arcname = file_path.relative_to(worktree_path)
+                        zf.write(file_path, arcname=str(arcname))
 
             if bootstrap_log_path.exists():
                 zf.write(bootstrap_log_path, arcname="bootstrap.txt")
@@ -152,32 +152,11 @@ def archive_worktree(
             if harness_tests_log_path.exists():
                 zf.write(harness_tests_log_path, arcname="harness-tests.txt")
 
-            # 02-agent.diff
-            agent_diff: str = ""
-            try:
-                current_head = _git_generic(worktree_path, "rev-parse", "HEAD").stdout.strip()
-            except subprocess.CalledProcessError:
-                current_head = ""
-
-            try:
-                if pre_agent_head and current_head and pre_agent_head == current_head:
-                    # No new commit by agent; capture dirty diff (may be empty)
-                    agent_diff = _git_generic(worktree_path, "diff").stdout
-                else:
-                    # Either agent committed or pre_agent_head unknown; show HEAD commit
-                    agent_diff = _git_generic(worktree_path, "show", "HEAD").stdout
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Unable to compute agent diff for {worktree_path}: {e}")
-                agent_diff = ""
-
-            zf.writestr("02-agent.diff", agent_diff)
-
         logger.info(f"Successfully created archive {zip_path}")
         return zip_path
 
     finally:
-        if cleanup:
-            cleanup_worktree(project_path, worktree_path)
+        cleanup_worktree(project_path, worktree_path)
 
 
 def _archive_worker(worktree_path_str: str):

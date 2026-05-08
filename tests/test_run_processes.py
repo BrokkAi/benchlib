@@ -253,7 +253,7 @@ def test_archive_worktree_writes_zip_to_archive_root(tmp_path: pathlib.Path, mon
         assert "harness-tests.txt" in zf.namelist()
 
 
-def test_archive_worktree_can_skip_cleanup_and_use_custom_name(
+def test_archive_worktree_cleans_up_and_uses_custom_name(
     tmp_path: pathlib.Path, monkeypatch
 ) -> None:
     project = tmp_path / "repo"
@@ -275,6 +275,9 @@ def test_archive_worktree_can_skip_cleanup_and_use_custom_name(
     llm_history = worktree / ".brokk" / "llm-history"
     llm_history.mkdir(parents=True, exist_ok=True)
     (llm_history / "session.log").write_text("history\n", encoding="utf-8")
+    sft_gen = worktree / ".brokk" / "sft_gen"
+    sft_gen.mkdir(parents=True, exist_ok=True)
+    (sft_gen / "attempts.json").write_text("{\"attempts\": []}\n", encoding="utf-8")
 
     fake_home = tmp_path / "home"
     fake_home.mkdir()
@@ -285,18 +288,17 @@ def test_archive_worktree_can_skip_cleanup_and_use_custom_name(
         worktree,
         pre_agent_head=None,
         archive_name="model/a:1",
-        cleanup=False,
     )
 
     expected_path = fake_home / "brokkbench-archive" / project.name / "model_a_1.zip"
     assert zip_path == expected_path
     assert expected_path.exists()
-    assert worktree.exists()
+    assert not worktree.exists()
     with zipfile.ZipFile(expected_path) as zf:
         assert "run-output.txt" in zf.namelist()
-
-    benchlib.archive.cleanup_worktree(project, worktree)
-    assert not worktree.exists()
+        assert ".brokk/sft_gen/attempts.json" in zf.namelist()
+        assert "01-tests.diff" not in zf.namelist()
+        assert "02-agent.diff" not in zf.namelist()
 
 
 def test_run_many_tasks_preserves_live_worktree_in_json_when_archive_fails(
