@@ -6,6 +6,7 @@ import os
 import pathlib
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -88,6 +89,47 @@ class HeapBudget:
             self._cond.notify_all()
 
 
+class TaskExecutionController:
+    """Track task phase and the active agent subprocess for external cancellation."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._agent_proc: subprocess.Popen[bytes] | None = None
+        self._phase = "queued"
+
+    def set_phase(self, phase: str) -> None:
+        with self._lock:
+            self._phase = phase
+
+    def phase(self) -> str:
+        with self._lock:
+            return self._phase
+
+    def register_agent_process(self, proc: subprocess.Popen[bytes]) -> None:
+        with self._lock:
+            self._agent_proc = proc
+
+    def clear_agent_process(self, proc: subprocess.Popen[bytes] | None = None) -> None:
+        with self._lock:
+            if proc is None or self._agent_proc is proc:
+                self._agent_proc = None
+
+    def kill_agent_process(self) -> bool:
+        with self._lock:
+            proc = self._agent_proc
+            phase = self._phase
+        if proc is None or phase != "agent_running":
+            return False
+        if proc.poll() is not None:
+            self.clear_agent_process(proc)
+            return False
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return False
+        return True
+
+
 def _resolve_cli_bin() -> pathlib.Path:
     env_path = os.getenv("BRK_CLI_BIN")
     if env_path:
@@ -126,7 +168,12 @@ def _merged_env(task_env: dict[str, str] | None) -> dict[str, str]:
     return env
 
 
-def _run_cli(cmd: list[str], log_file: pathlib.Path, env: dict[str, str] | None) -> subprocess.CompletedProcess:
+def _run_cli(
+    cmd: list[str],
+    log_file: pathlib.Path,
+    env: dict[str, str] | None,
+    execution_controller: TaskExecutionController | None = None,
+) -> subprocess.CompletedProcess:
     full_cmd = cmd
 
     if os.getenv("BB_DEBUG"):
@@ -138,7 +185,10 @@ def _run_cli(cmd: list[str], log_file: pathlib.Path, env: dict[str, str] | None)
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=env,
+            start_new_session=True,
         ) as proc, open(log_file, "ab") as log_fp:
+            if execution_controller is not None:
+                execution_controller.register_agent_process(proc)
             assert proc.stdout is not None
             for line in proc.stdout:
                 log_fp.write(line)
@@ -150,8 +200,13 @@ def _run_cli(cmd: list[str], log_file: pathlib.Path, env: dict[str, str] | None)
                         sys.stderr.write(line.decode(errors="replace"))
                         sys.stderr.flush()
             proc.wait()
+            if execution_controller is not None:
+                execution_controller.clear_agent_process(proc)
     except Exception as exc:
         raise RuntimeError(f"Failed to execute command: {' '.join(full_cmd)}") from exc
+    finally:
+        if execution_controller is not None:
+            execution_controller.clear_agent_process()
 
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout=None, stderr=None)
 
@@ -233,6 +288,7 @@ def _run_one_task(
     | None = None,
     on_task_start: Callable[[Task, pathlib.Path, int], None] | None = None,
     attempt: int = 1,
+    execution_controller: TaskExecutionController | None = None,
 ) -> RunResult:
     project_path = pathlib.Path(task.project).resolve()
     if not (project_path / ".git").is_dir():
@@ -292,6 +348,8 @@ def _run_one_task(
             print(f"[{task.model}] {message}", file=sys.stderr)
 
     try:
+        if execution_controller is not None:
+            execution_controller.set_phase("agent_running")
         _log_stage(
             f"Starting task: project={project_path} revision={task.revision} run_number={task.run_number} "
             f"task_id={task.task_id} cli={cli_bin}"
@@ -316,7 +374,7 @@ def _run_one_task(
             f"--project={project_path}",
             f"--worktree={worktree_path}",
         ]
-        first_ret = _run_cli(first_cmd, agent_log_path, env=env)
+        first_ret = _run_cli(first_cmd, agent_log_path, env=env, execution_controller=execution_controller)
         _log_stage(f"First cli return code: {first_ret.returncode}")
         if first_ret.returncode != 0:
             _log_stage(f"First cli failed with return code {first_ret.returncode}")
@@ -357,7 +415,7 @@ def _run_one_task(
             f"--worktree={worktree_path}",
             *cli_args,
         ]
-        second_ret = _run_cli(second_cmd, agent_log_path, env=env)
+        second_ret = _run_cli(second_cmd, agent_log_path, env=env, execution_controller=execution_controller)
         _log_stage(f"Second cli return code: {second_ret.returncode}")
         if second_ret.returncode != 0:
             _log_stage(f"Second cli failed with return code {second_ret.returncode}")
@@ -376,6 +434,8 @@ def _run_one_task(
         stop_reason = _stop_reason(metrics)
         tests_failed = False
         if execute_tests is not None and stop_reason == "SUCCESS":
+            if execution_controller is not None:
+                execution_controller.set_phase("tests_running")
             _log_stage("Running execute_tests callback")
             try:
                 try:
@@ -440,6 +500,10 @@ def _run_one_task(
         except Exception:
             pass
         raise
+    finally:
+        if execution_controller is not None:
+            execution_controller.clear_agent_process()
+            execution_controller.set_phase("finished")
 
 
 def _run_with_retries(
@@ -453,6 +517,7 @@ def _run_with_retries(
     commit_tests: Callable[[pathlib.Path, pathlib.Path, str, dict[str, str], dict[str, str] | None], None]
     | None = None,
     on_task_start: Callable[[Task, pathlib.Path, int], None] | None = None,
+    execution_controller: TaskExecutionController | None = None,
 ) -> tuple[RunResult, bool]:
     MAX_ATTEMPTS = 3
     project_path = pathlib.Path(task.project).resolve()
@@ -471,6 +536,7 @@ def _run_with_retries(
             commit_tests=commit_tests,
             on_task_start=on_task_start,
             attempt=attempt,
+            execution_controller=execution_controller,
         )
         last_result = result
 
@@ -529,6 +595,7 @@ def run_many_tasks(
     | None = None,
     on_task_start: Callable[[Task, pathlib.Path, int], None] | None = None,
     max_heap_mb: int | None = None,
+    execution_controller: TaskExecutionController | None = None,
 ) -> dict[Task, RunResult]:
     """
     Run tasks concurrently using a thread pool.
@@ -586,6 +653,7 @@ def run_many_tasks(
                 execute_tests,
                 commit_tests,
                 on_task_start,
+                execution_controller,
             )
         finally:
             heap_budget.release(weight)
@@ -604,6 +672,7 @@ def run_many_tasks(
                     execute_tests,
                     commit_tests,
                     on_task_start,
+                    execution_controller,
                 )
             else:
                 future = executor.submit(_heap_aware_wrapper, task)

@@ -3,6 +3,8 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
+import time
 import zipfile
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -722,3 +724,32 @@ def test_run_many_tasks_normalizes_success_with_empty_changed_files_to_no_edits(
     data = json.loads(result_file.read_text(encoding="utf-8"))
     assert data["stopReason"] == "NO_EDITS"
     assert data["changedFiles"] == []
+
+
+def test_run_cli_supports_agent_process_kill(tmp_path: pathlib.Path) -> None:
+    log_path = tmp_path / "agent.log"
+    controller = benchlib.run.TaskExecutionController()
+    controller.set_phase("agent_running")
+
+    def _run() -> subprocess.CompletedProcess:
+        return benchlib.run._run_cli(
+            ["/bin/sh", "-c", "sleep 10"],
+            log_path,
+            env=None,
+            execution_controller=controller,
+        )
+
+    result_holder: dict[str, subprocess.CompletedProcess] = {}
+    runner = threading.Thread(target=lambda: result_holder.setdefault("result", _run()), daemon=True)
+    runner.start()
+
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        if controller.kill_agent_process():
+            break
+        time.sleep(0.05)
+
+    runner.join(timeout=2)
+
+    assert not runner.is_alive()
+    assert result_holder["result"].returncode != 0
