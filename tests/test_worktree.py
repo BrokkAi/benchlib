@@ -46,6 +46,37 @@ def test_repo_requires_git_lfs_false_for_normal_repo(tmp_path: Path) -> None:
     assert repo_requires_git_lfs(str(repo / ".git")) is False
 
 
+def test_repo_requires_git_lfs_ignores_unreadable_git_objects(monkeypatch) -> None:
+    missing_blob = "f050bb655cd6eac97eb50077c7e6ad9138f35c62"
+
+    class FakeTree:
+        def __iter__(self):
+            return iter(
+                [
+                    SimpleNamespace(
+                        type="blob",
+                        name=".gitattributes",
+                        id=missing_blob,
+                    )
+                ]
+            )
+
+    class FakeHead:
+        tree = FakeTree()
+
+    class FakeRepo:
+        def revparse_single(self, revision: str):
+            assert revision == "HEAD"
+            return FakeHead()
+
+        def __getitem__(self, key: str):
+            raise KeyError(key)
+
+    monkeypatch.setattr("benchlib.worktree.pygit2.Repository", lambda _path: FakeRepo())
+
+    assert repo_requires_git_lfs("/fake/repo/.git") is False
+
+
 def test_materialize_detached_worktree_rejects_git_lfs_repo_before_git_worktree(
     tmp_path: Path,
     monkeypatch,

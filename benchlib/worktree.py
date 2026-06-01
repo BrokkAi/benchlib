@@ -68,7 +68,10 @@ def _called_process_message(exc: subprocess.CalledProcessError) -> str:
 
 
 def _blob_text(repo: pygit2.Repository, entry: pygit2.IndexEntry | pygit2.TreeEntry) -> str:
-    blob = repo[entry.id]
+    try:
+        blob = repo[entry.id]
+    except (KeyError, pygit2.GitError):
+        return ""
     data = getattr(blob, "data", b"")
     if isinstance(data, bytes):
         return data.decode("utf-8", errors="ignore")
@@ -81,7 +84,10 @@ def _tree_declares_git_lfs(repo: pygit2.Repository, tree: pygit2.Tree) -> bool:
         current = stack.pop()
         for entry in current:
             if entry.type == "tree":
-                stack.append(repo[entry.id])
+                try:
+                    stack.append(repo[entry.id])
+                except (KeyError, pygit2.GitError):
+                    continue
                 continue
             if entry.name == ".lfsconfig":
                 return True
