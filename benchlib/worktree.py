@@ -9,6 +9,10 @@ from pathlib import Path
 import pygit2
 
 
+class UnsupportedRepositoryError(RuntimeError):
+    """Raised when a repository uses features unsupported by this environment."""
+
+
 def _sanitize_worktree_suffix(value: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-")
     return sanitized or "worktree"
@@ -63,6 +67,54 @@ def _called_process_message(exc: subprocess.CalledProcessError) -> str:
     return "\n".join(parts)
 
 
+def _blob_text(repo: pygit2.Repository, entry: pygit2.IndexEntry | pygit2.TreeEntry) -> str:
+    blob = repo[entry.id]
+    data = getattr(blob, "data", b"")
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="ignore")
+    return str(data)
+
+
+def _tree_declares_git_lfs(repo: pygit2.Repository, tree: pygit2.Tree) -> bool:
+    stack = [tree]
+    while stack:
+        current = stack.pop()
+        for entry in current:
+            if entry.type == "tree":
+                stack.append(repo[entry.id])
+                continue
+            if entry.name == ".lfsconfig":
+                return True
+            if entry.name != ".gitattributes":
+                continue
+            contents = _blob_text(repo, entry)
+            if "filter=lfs" in contents or "diff=lfs" in contents or "merge=lfs" in contents:
+                return True
+    return False
+
+
+def repo_requires_git_lfs(repo_path: str) -> bool:
+    try:
+        repo = pygit2.Repository(repo_path)
+    except pygit2.GitError:
+        return False
+    try:
+        head = repo.revparse_single("HEAD")
+    except (AttributeError, KeyError, ValueError, pygit2.GitError):
+        return False
+    tree = getattr(head, "tree", None)
+    if tree is None:
+        return False
+    return _tree_declares_git_lfs(repo, tree)
+
+
+def _is_missing_git_lfs_error(message: str) -> bool:
+    lowered = message.lower()
+    return "git-lfs" in lowered and (
+        "filter-process" in lowered or "not found" in lowered or "is not a git command" in lowered
+    )
+
+
 @contextmanager
 def materialize_detached_worktree(
     repo_path: str,
@@ -71,6 +123,8 @@ def materialize_detached_worktree(
     prefix: str = "worktree",
     label_revision: str | None = None,
 ):
+    if repo_requires_git_lfs(repo_path):
+        raise UnsupportedRepositoryError(f"Repository at {repo_path} uses Git LFS")
     repo = pygit2.Repository(repo_path)
     if repo.workdir is None:
         raise ValueError(f"Repository at {repo_path} does not have a workdir")
@@ -90,7 +144,10 @@ def materialize_detached_worktree(
         )
     except subprocess.CalledProcessError as exc:
         cleanup_detached_worktree(repo_root, worktree_path)
-        raise RuntimeError(_called_process_message(exc)) from exc
+        detail = _called_process_message(exc)
+        if _is_missing_git_lfs_error(detail):
+            raise UnsupportedRepositoryError(f"Repository at {repo_path} uses Git LFS") from exc
+        raise RuntimeError(detail) from exc
     try:
         yield worktree_path
     finally:
